@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "ingress": {
+    "telegram": {
+      "enabled": false,
+      "botTokenEnvVar": "TELEGRAM_BOT_TOKEN",
+      "allowedChatIds": []
+    }
+  },
+  "agent": {
+    "defaultProvider": "microsoft-foundry",
+    "defaultModel": "gpt-5-mini",
+    "systemPromptFile": "AGENTS.md",
+    "memoryWindow": 50,
+    "maxTokens": 4096,
+    "thinkingLevel": "low",
+    "llmProviders": [
+      {
+        "provider": "openai",
+        "models": ["gpt-4o-mini"],
+        "enabled": true,
+        "apiKeyEnvVar": "OPENAI_API_KEY",
+        "category": "openai"
+      },
+      {
+        "provider": "microsoft-foundry",
+        "models": ["gpt-5.3-chat", "gpt-5-mini"],
+        "enabled": true,
+        "apiKeyEnvVar": "MICROSOFT_FOUNDRY_API_KEY",
+        "category": "openai",
+        "baseUrl": "https://zihan-foundry-project-1-resource.openai.azure.com/openai/v1"
+      }
+    ]
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "workspaceRoot": ".",
+    "mcpServers": []
+  }
+}
