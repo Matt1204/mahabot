@@ -2,9 +2,12 @@ import { stdin as input, stdout as output } from "node:process";
 import readline from "node:readline/promises";
 
 import { Agent } from "../agent/index.js";
-import { ConfigManager, createModelFromConfig } from "../config/index.js";
-import type { LlmProviderConfig } from "../config/types.js";
-import type { Model } from "@mariozechner/pi-ai";
+import { ConfigManager } from "../config/index.js";
+import { ContextManager } from "../context/index.js";
+
+const DEMO_SESSION_ID = "cli-stable-session";
+const DEMO_PROVIDER_NAME = "microsoft-foundry";
+const DEMO_MODEL_NAME = "gpt-5.3-chat";
 /**
  * Future gateway/external manager entrypoint.
  *
@@ -16,51 +19,41 @@ import type { Model } from "@mariozechner/pi-ai";
  * - external transport orchestration
  */
 export class MahabotGatewayManager {
+  private readonly contextManager: ContextManager;
+
   constructor(
     private readonly configManager: ConfigManager = new ConfigManager(),
     private readonly io = { input, output },
-  ) {}
+  ) {
+    this.contextManager = new ContextManager(this.configManager, {
+      debug: () => {},
+      warn: console.warn,
+      error: console.error,
+    });
+  }
 
-  async runInCliMode(llmProvider?: string, modelId?: string): Promise<void> {
+  async runInCliMode(): Promise<void> {
+    const bootstrap = await this.configManager.initializeSessionWorkspace(DEMO_SESSION_ID);
+
+    if (bootstrap.isFirstConfigCreated) {
+      this.io.output.write(
+        [
+          "Created session config for mahabot.",
+          `Config path: ${bootstrap.configPath}`,
+          "Please fill in required values in the config file, then re-run `mahabot cli`.",
+          "",
+        ].join("\n"),
+      );
+      return;
+    }
+
     await this.configManager.load();
 
-    // Create model with optional override parameters (falls back to defaults if not provided)
-    const model: Model<any> = createModelFromConfig(
-      this.configManager.get(),
-      llmProvider,
-      modelId,
-    );
-    // Validate credentials exist for the resolved provider (does not expose API key to memory)
-    this.configManager.ensureProviderCredentials(model.provider);
-
-    const systemPrompt = "You are mahabot CLI assistant. Be concise and practical.";
-
-    const agent = new Agent(
-      {
-        model,
-        systemPrompt,
-        thinkingLevel: this.configManager.getThinkingLevel(),
-        tools: [],
-        getApiKey: (p) =>
-          this.configManager.getApiKeyForProvider(
-            this.configManager.getTargetProviderConfig(p) as any,
-          ),
-        sessionId: "cli-session",
-        transport: "sse",
-        maxRetryDelayMs: 15000,
-      },
-      {
-        // CLI prints final assistant text itself; suppress noisy event logs.
-        logger: {
-          debug: () => {},
-          info: () => {},
-          warn: console.warn,
-          error: console.error,
-        },
-        outboundSink: async () => {
-          // keep outbound in-process for CLI mode
-        },
-      },
+    let agent = await this.buildAgentFromSession(
+      bootstrap.workspaceSessionId,
+      bootstrap.sessionRoot,
+      bootstrap.workspaceRoot,
+      bootstrap.persistenceRoot
     );
 
     const rl = readline.createInterface({
@@ -90,9 +83,18 @@ export class MahabotGatewayManager {
         }
 
         if (line === "/clear") {
-          // reset keeps model/tools/system prompt, but clears message history and queues.
-          agent.reset();
-          this.io.output.write("Conversation context cleared.\n\n");
+          try {
+            await agent.waitForIdle();
+            agent = await this.buildAgentFromSession(
+              bootstrap.workspaceSessionId,
+              bootstrap.sessionRoot,
+              bootstrap.workspaceRoot,
+              bootstrap.persistenceRoot
+            );
+            this.io.output.write("Conversation context cleared and system prompt reloaded.\n\n");
+          } catch (error) {
+            this.io.output.write(`bot> [error] ${String(error)}\n\n`);
+          }
           continue;
         }
 
@@ -107,6 +109,47 @@ export class MahabotGatewayManager {
       rl.close();
       await agent.waitForIdle();
     }
+  }
+
+  private async buildAgentFromSession(
+    workspaceSessionId: string,
+    sessionRoot: string,
+    workspaceRoot: string,
+    persistenceRoot: string
+  ): Promise<Agent> {
+    const systemPromptAssembly = await this.contextManager.assembleSystemPrompt(
+      workspaceSessionId,
+      sessionRoot,
+      workspaceRoot,
+      persistenceRoot
+    );
+
+    return Agent.fromAppConfig(
+      {
+        appConfig: this.configManager.get(),
+        providerName: DEMO_PROVIDER_NAME,
+        modelName: DEMO_MODEL_NAME,
+        systemPrompt: systemPromptAssembly.systemPrompt,
+        thinkingLevel: this.configManager.getThinkingLevel(),
+        tools: [],
+        ensureProviderCredentials: (providerName) =>
+          this.configManager.ensureProviderCredentials(providerName),
+        getApiKey: (providerName) =>
+          this.configManager.getApiKeyForProviderName(providerName),
+      },
+      {
+        // CLI prints final assistant text itself; suppress noisy event logs.
+        logger: {
+          debug: () => {},
+          info: () => {},
+          warn: console.warn,
+          error: console.error,
+        },
+        outboundSink: async () => {
+          // keep outbound in-process for CLI mode
+        },
+      }
+    );
   }
 }
 

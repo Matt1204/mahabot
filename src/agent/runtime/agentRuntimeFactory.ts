@@ -23,25 +23,25 @@ import type { AgentRuntimeConfig } from "../types.js";
  *    - getApiKey: async (provider) => provider === "openai" ? "sk-..." : undefined
  */
 
-export function createAgentRuntime(config: AgentRuntimeConfig): PiAgent {
-  const model: Model<any> = config.model;
+export function createAgentRuntime(agentRuntimeconfig: AgentRuntimeConfig): PiAgent {
+  const model: Model<any> = agentRuntimeconfig.model;
 
   return new PiAgent({
     initialState: {
-      systemPrompt: config.systemPrompt,
+      systemPrompt: agentRuntimeconfig.systemPrompt,
       model,
-      thinkingLevel: config.thinkingLevel,
-      tools: config.tools,
+      thinkingLevel: agentRuntimeconfig.thinkingLevel,
+      tools: agentRuntimeconfig.tools,
       messages: [],
     },
-    convertToLlm: config.convertToLlm ?? defaultConvertToLlm,
-    transformContext: config.transformContext,
-    sessionId: config.sessionId,
-    getApiKey: config.getApiKey,
-    onPayload: config.onPayload as any,
-    thinkingBudgets: config.thinkingBudgets as any,
-    transport: config.transport,
-    maxRetryDelayMs: config.maxRetryDelayMs,
+    convertToLlm: agentRuntimeconfig.convertToLlm ?? defaultConvertToLlm,
+    transformContext: agentRuntimeconfig.transformContext,
+    sessionId: agentRuntimeconfig.sessionId,
+    getApiKey: agentRuntimeconfig.getApiKey,
+    onPayload: agentRuntimeconfig.onPayload as any,
+    thinkingBudgets: agentRuntimeconfig.thinkingBudgets as any,
+    transport: agentRuntimeconfig.transport,
+    maxRetryDelayMs: agentRuntimeconfig.maxRetryDelayMs,
   } as any);
 }
 

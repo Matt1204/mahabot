@@ -1,6 +1,7 @@
 export { Agent } from "./agent.js";
 export type {
   AgentDependencies,
+  AgentFromAppConfigInput,
   AgentRuntimeConfig,
   CliTurnResult,
   InboundMessageTemp,

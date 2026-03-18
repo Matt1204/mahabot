@@ -1,5 +1,6 @@
 import type { AgentMessage, AgentTool, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
+import type { AppConfig } from "../config/types.js";
 
 export type Channel = "cli" | "telegram" | "unknown";
 
@@ -41,6 +42,17 @@ export interface AgentRuntimeConfig {
   transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
   onPayload?: (payload: unknown) => unknown;
+}
+
+export interface AgentFromAppConfigInput {
+  appConfig: AppConfig;
+  providerName: string;
+  modelName: string;
+  systemPrompt: string;
+  thinkingLevel: ThinkingLevel;
+  tools: AgentTool<any>[];
+  ensureProviderCredentials?: (providerName: string) => void;
+  getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 }
 
 export interface AgentDependencies {

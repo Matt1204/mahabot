@@ -1,4 +1,5 @@
 import type { Agent as PiAgentRuntime, AgentMessage } from "@mariozechner/pi-agent-core";
+import { createModelFromConfig } from "../config/modelFactory.js";
 
 import {
   parseAgentResponseToOutboundTemp,
@@ -9,6 +10,7 @@ import {
 import { createAgentRuntime as createPiAgentRuntime } from "./runtime/agentRuntimeFactory.js";
 import type {
   AgentDependencies,
+  AgentFromAppConfigInput,
   AgentRuntimeConfig,
   CliTurnResult,
   InboundMessageTemp,
@@ -28,6 +30,21 @@ export class Agent {
   private running = false;
   private loopAbortController: AbortController | null = null;
   private serialQueue: Promise<void> = Promise.resolve();
+
+  static fromAppConfig(input: AgentFromAppConfigInput, deps: AgentDependencies = {}): Agent {
+    const model = createModelFromConfig(input.appConfig, input.providerName, input.modelName);
+    input.ensureProviderCredentials?.(model.provider);
+
+    const runtimeConfig: AgentRuntimeConfig = {
+      model,
+      systemPrompt: input.systemPrompt,
+      thinkingLevel: input.thinkingLevel,
+      tools: input.tools,
+      getApiKey: input.getApiKey,
+    };
+
+    return new Agent(runtimeConfig, deps);
+  }
 
   constructor(agentRuntimeConfig: AgentRuntimeConfig, deps: AgentDependencies = {}) {
     this.agentRuntime = createPiAgentRuntime(agentRuntimeConfig);

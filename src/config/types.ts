@@ -24,6 +24,7 @@ export interface AgentConfig {
   defaultProvider: string;
   defaultModel: string;
   systemPromptFile: string;
+  workspaceRoot: string;
   memoryWindow: number;
   maxTokens: number;
   thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -40,7 +41,6 @@ export interface McpServerConfig {
 
 export interface ToolsConfig {
   restrictToWorkspace: boolean;
-  workspaceRoot: string;
   mcpServers: McpServerConfig[];
 }
 
@@ -64,6 +64,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     defaultProvider: "openai",
     defaultModel: "gpt-4o-mini",
     systemPromptFile: "AGENTS.md",
+    workspaceRoot: ".",
     memoryWindow: 50,
     maxTokens: 4096,
     thinkingLevel: "off",
@@ -78,7 +79,6 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   tools: {
     restrictToWorkspace: true,
-    workspaceRoot: ".",
     mcpServers: [],
   },
 };

@@ -1,14 +1,35 @@
-import { access, readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { AppConfig, LlmProviderConfig } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const TEMPLATE_ROOT_ENV_VAR = "MAHABOT_TEMPLATE_ROOT";
+
 
 export type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
 };
+
+export interface WorkspaceBootstrapResult {
+  workspaceSessionId: string;
+  sessionRoot: string;
+  workspaceRoot: string;
+  persistenceRoot: string;
+  configPath: string;
+  isFirstConfigCreated: boolean;
+}
+
+export type PromptScaffoldFileName = "SOUL.md" | "USER.md";
+
+export interface PromptScaffoldResult {
+  created: boolean;
+  filePath: string;
+}
 
 export class ConfigManager {
   private configPath: string;
@@ -27,6 +48,87 @@ export class ConfigManager {
     this.configPath = resolve(nextPath);
   }
 
+  async initializeSessionWorkspace(workspaceSessionId: string): Promise<WorkspaceBootstrapResult> {
+    const sanitizedSessionId = sanitizeWorkspaceSessionId(workspaceSessionId);
+    const sessionRoot = resolve(homedir(), ".mahaBot", sanitizedSessionId);
+    const workspaceRoot = resolve(sessionRoot, "workspace");
+    const persistenceRoot = resolve(sessionRoot, "persistence");
+    const configPath = resolve(sessionRoot, "config.json");
+
+    await ensureDir(sessionRoot);
+    await ensureDir(workspaceRoot);
+    await ensureDir(persistenceRoot);
+
+    const configTemplatePath = await this.getTemplatePath("config.json");
+    const agentsTemplatePath = await this.getTemplatePath("AGENTS.md");
+    const soulTemplatePath = await this.getTemplatePath("SOUL.md");
+    const userTemplatePath = await this.getTemplatePath("USER.md");
+
+    const isFirstConfigCreated = await copyFileIfMissing(configTemplatePath, configPath);
+    await copyFileIfMissing(agentsTemplatePath, resolve(sessionRoot, "AGENTS.md"));
+    await copyFileIfMissing(soulTemplatePath, resolve(sessionRoot, "SOUL.md"));
+    await copyFileIfMissing(userTemplatePath, resolve(sessionRoot, "USER.md"));
+
+    await writeFileIfMissing(resolve(persistenceRoot, "history.md"), "");
+    await writeFileIfMissing(resolve(persistenceRoot, "session.jsonl"), "");
+
+    this.setPath(configPath);
+
+    return {
+      workspaceSessionId: sanitizedSessionId,
+      sessionRoot,
+      workspaceRoot,
+      persistenceRoot,
+      configPath: this.path,
+      isFirstConfigCreated,
+    };
+  }
+
+  async ensurePromptScaffoldIfMissing(
+    sessionRoot: string,
+    fileName: PromptScaffoldFileName
+  ): Promise<PromptScaffoldResult> {
+    const destinationPath = resolve(sessionRoot, fileName);
+    const templatePath = await this.getTemplatePath(fileName);
+    const created = await copyFileIfMissing(templatePath, destinationPath);
+
+    return {
+      created,
+      filePath: destinationPath,
+    };
+  }
+
+  private async getTemplatePath(fileName: string): Promise<string> {
+    const attemptedPaths = this.getTemplateCandidateRoots().map((root) => resolve(root, fileName));
+
+    for (const filePath of attemptedPaths) {
+      if (await fileExists(filePath)) {
+        return filePath;
+      }
+    }
+
+    throw new Error(
+      [
+        `Template file not found: '${fileName}'.`,
+        `Checked ${attemptedPaths.length} location(s):`,
+        ...attemptedPaths.map((path) => `- ${path}`),
+        `You can override template root via ${TEMPLATE_ROOT_ENV_VAR}.`,
+      ].join("\n")
+    );
+  }
+
+  private getTemplateCandidateRoots(): string[] {
+    const configuredRoot = process.env[TEMPLATE_ROOT_ENV_VAR]?.trim();
+    const roots = [
+      configuredRoot,
+      resolve(MODULE_DIR, "config_template"),
+      resolve(MODULE_DIR, "..", "..", "src", "config", "config_template"),
+      resolve(process.cwd(), "src", "config", "config_template"),
+    ];
+
+    return roots.filter((entry): entry is string => !!entry);
+  }
+
   get(): AppConfig {
     // Defensive copy: callers get data, but cannot mutate internal state directly.
     return clone(this.config);
@@ -37,13 +139,9 @@ export class ConfigManager {
     const exists = await fileExists(this.configPath);
 
     if (!exists) {
-      // First run scenario:
-      // 1) start from safe defaults in memory,
-      // 2) persist them to disk so users can edit the generated file later,
-      // 3) return a cloned copy to callers.
-      this.config = clone(DEFAULT_CONFIG);
-      await this.save();
-      return this.get();
+      throw new Error(
+        `Config file not found at '${this.configPath}'. Run workspace initialization before loading config.`
+      );
     }
 
     // Existing file scenario:
@@ -66,6 +164,7 @@ export class ConfigManager {
 
     // Persist pretty JSON so the file is human-readable in editors.
     // Trailing newline is a common file formatting convention.
+    await ensureDir(dirname(this.configPath));
     await writeFile(this.configPath, `${JSON.stringify(this.config, null, 2)}\n`, "utf-8");
   }
 
@@ -98,6 +197,14 @@ export class ConfigManager {
     }
 
     return undefined;
+  }
+
+  getApiKeyForProviderName(provider: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const providerConfig = this.getTargetProviderConfig(provider);
+    if (!providerConfig) {
+      return undefined;
+    }
+    return this.getApiKeyForProvider(providerConfig, env);
   }
 
   getBaseUrlForProvider(provider: string): string | undefined {
@@ -183,6 +290,14 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: agent.maxTokens must be >= 1.");
   }
 
+  if (typeof merged.agent.workspaceRoot !== "string" || merged.agent.workspaceRoot.trim().length === 0) {
+    throw new Error("Invalid config: agent.workspaceRoot must be a non-empty string.");
+  }
+
+  if ("workspaceRoot" in (merged.tools as unknown as Record<string, unknown>)) {
+    throw new Error("Invalid config: tools.workspaceRoot is no longer supported. Use agent.workspaceRoot.");
+  }
+
   return merged;
 }
 
@@ -243,4 +358,37 @@ async function fileExists(path: string): Promise<boolean> {
     // Any failure is treated as "not available" for load bootstrap logic.
     return false;
   }
+}
+
+function sanitizeWorkspaceSessionId(input: string): string {
+  const sanitized = input.trim().replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_");
+  return sanitized || "session";
+}
+
+async function ensureDir(path: string): Promise<void> {
+  await mkdir(path, { recursive: true });
+}
+
+async function copyFileIfMissing(sourcePath: string, destinationPath: string): Promise<boolean> {
+  if (await fileExists(destinationPath)) {
+    return false;
+  }
+
+  if (!(await fileExists(sourcePath))) {
+    throw new Error(`Template file not found: '${sourcePath}'.`);
+  }
+
+  await ensureDir(dirname(destinationPath));
+  await copyFile(sourcePath, destinationPath);
+  return true;
+}
+
+async function writeFileIfMissing(path: string, content: string): Promise<boolean> {
+  if (await fileExists(path)) {
+    return false;
+  }
+
+  await ensureDir(dirname(path));
+  await writeFile(path, content, "utf-8");
+  return true;
 }

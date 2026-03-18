@@ -10,7 +10,7 @@
     "dev": "tsx src/cli.ts cli",
     "cli": "tsx src/cli.ts cli",
     "playground": "tsx src/cli.ts playground",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-config-templates.mjs",
     "start": "node dist/cli.js"
   },
   "engines": {
