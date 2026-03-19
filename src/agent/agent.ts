@@ -1,5 +1,6 @@
-import type { Agent as PiAgentRuntime, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Agent as PiAgentRuntime, AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { createModelFromConfig } from "../config/modelFactory.js";
+import { assembleTools, ToolRegistry } from "./tools/index.js";
 
 import {
   parseAgentResponseToOutboundTemp,
@@ -25,25 +26,39 @@ export class Agent {
   private readonly inboundSource?: (signal?: AbortSignal) => Promise<InboundMessageTemp | null>;
   private readonly outboundSink?: (message: OutboundMessageTemp) => Promise<void> | void;
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
-  private readonly onAgentEvent?: (event: unknown) => void;
+  private readonly onAgentEvent?: (event: AgentEvent) => void;
 
   private running = false;
   private loopAbortController: AbortController | null = null;
   private serialQueue: Promise<void> = Promise.resolve();
 
-  static fromAppConfig(input: AgentFromAppConfigInput, deps: AgentDependencies = {}): Agent {
+  /**
+   * Static builder for composing runtime dependencies from app-level config.
+   * Responsibility split:
+   * - this method resolves model/credentials/tools from AppConfig.
+   * - constructor only receives fully resolved AgentRuntimeConfig and wires runtime lifecycle.
+   */
+  static createFromAppConfig(input: AgentFromAppConfigInput, deps: AgentDependencies = {}): Agent {
+    // 1. create model
     const model = createModelFromConfig(input.appConfig, input.providerName, input.modelName);
     input.ensureProviderCredentials?.(model.provider);
 
-    const runtimeConfig: AgentRuntimeConfig = {
+    // 2. assemble tools through the central tool-assembly seam
+    const toolRegistry = input.toolRegistry ?? new ToolRegistry();
+    if (!input.toolRegistry) {
+      assembleTools(toolRegistry, input.appConfig);
+    }
+
+    const agentRuntimeConfig: AgentRuntimeConfig = {
       model,
       systemPrompt: input.systemPrompt,
       thinkingLevel: input.thinkingLevel,
-      tools: input.tools,
+      toolRegistry,
       getApiKey: input.getApiKey,
     };
 
-    return new Agent(runtimeConfig, deps);
+    // 3. instantiate the agent
+    return new Agent(agentRuntimeConfig, deps);
   }
 
   constructor(agentRuntimeConfig: AgentRuntimeConfig, deps: AgentDependencies = {}) {
@@ -58,7 +73,12 @@ export class Agent {
     // Keep this subscription always on so the playground can observe full event flow.
     this.agentRuntime.subscribe((event) => {
       this.logger.debug(`[pi-mono event] ${String((event as any).type)}`);
-      this.onAgentEvent?.(event);
+      try {
+        this.onAgentEvent?.(event);
+      } catch (error) {
+        // Never let inspection/event observers break agent loop execution.
+        this.logger.warn(`[agent event observer error] ${String(error)}`);
+      }
     });
   }
 
@@ -190,6 +210,7 @@ export class Agent {
     return this.runExclusive(async () => {
       const inbound = this.wrapToInboundMessageTemp(cliMsg, channel, chatId, userId);
       const llmMessages = await this.processInboundMessage(inbound);
+
       const assistantMessage = await this.invokeAgentLoop(llmMessages);
       const outbound = await this.parseAgentResponse(assistantMessage, inbound);
       await this.sendOutboundMessage(outbound);

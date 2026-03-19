@@ -4,6 +4,8 @@ export { DEFAULT_CONFIG } from "./types.js";
 export type {
   AgentConfig,
   AppConfig,
+  EventInspectionConfig,
+  EventInspectionIncludeConfig,
   IngressConfig,
   LlmProviderConfig as LlmProvider,
   LlmProviderConfig as LlmProviderCredential,

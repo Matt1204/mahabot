@@ -1,4 +1,4 @@
-export type PromptSectionId = "agents" | "runtime" | "soul" | "user" | "memory" | "skills";
+export type PromptSectionId = "agents" | "runtime" | "tools" | "soul" | "user" | "memory" | "skills";
 
 export interface PromptSection {
   id: PromptSectionId;

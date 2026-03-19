@@ -1,6 +1,7 @@
-import type { AgentMessage, AgentTool, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
 import type { AppConfig } from "../config/types.js";
+import { ToolRegistry } from "./tools/registry/toolRegistry.js";
 
 export type Channel = "cli" | "telegram" | "unknown";
 
@@ -33,7 +34,8 @@ export interface AgentRuntimeConfig {
   model: Model<any>;
   systemPrompt: string;
   thinkingLevel: ThinkingLevel;
-  tools: AgentTool<any>[];
+  // tools: AgentTool<any>[];
+  toolRegistry: ToolRegistry;
   sessionId?: string;
   transport?: "sse" | "websocket" | "auto";
   maxRetryDelayMs?: number;
@@ -50,7 +52,7 @@ export interface AgentFromAppConfigInput {
   modelName: string;
   systemPrompt: string;
   thinkingLevel: ThinkingLevel;
-  tools: AgentTool<any>[];
+  toolRegistry?: ToolRegistry;
   ensureProviderCredentials?: (providerName: string) => void;
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 }
@@ -61,7 +63,7 @@ export interface AgentDependencies {
   memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   logger?: Pick<Console, "debug" | "info" | "warn" | "error">;
   now?: () => number;
-  onAgentEvent?: (event: unknown) => void;
+  onAgentEvent?: (event: AgentEvent) => void;
 }
 
 export interface CliTurnResult {

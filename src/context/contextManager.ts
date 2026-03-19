@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import type { ToolRegistry } from "../agent/tools/registry/toolRegistry.js";
 import type { ConfigManager, PromptScaffoldFileName } from "../config/configManager.js";
 import type { ContextAssemblyResult, PromptSection } from "./types.js";
 
@@ -16,11 +17,12 @@ export class ContextManager {
     workspaceSessionId: string,
     sessionRoot: string,
     workspaceRoot: string,
-    persistenceRoot: string
+    persistenceRoot: string,
+    toolRegistry: ToolRegistry
   ): Promise<ContextAssemblyResult> {
     const agentsPath = resolve(sessionRoot, "AGENTS.md");
-    const soulPath = resolve(sessionRoot, "SOUL.md");
-    const userPath = resolve(sessionRoot, "USER.md");
+    const soulPath = resolve(workspaceRoot, "SOUL.md");
+    const userPath = resolve(workspaceRoot, "USER.md");
 
     const agents = await this.readRequiredFile(
       agentsPath,
@@ -54,6 +56,11 @@ export class ContextManager {
           resolve(persistenceRoot, "history.md"),
           resolve(persistenceRoot, "session.jsonl")
         ),
+      },
+      {
+        id: "tools",
+        required: false,
+        content: this.buildToolsPromptSection(toolRegistry),
       },
       { id: "soul", required: false, content: soul.trim() },
       { id: "user", required: false, content: user.trim() },
@@ -122,5 +129,18 @@ export class ContextManager {
       `historyPath: ${historyPath} (reserved for conversation transcript persistence)`,
       `sessionJsonlPath: ${sessionJsonlPath} (reserved for structured turn persistence)`,
     ].join("\n");
+  }
+
+  private buildToolsPromptSection(toolRegistry: ToolRegistry): string {
+    const rulesOfTools = toolRegistry.getAllToolRulePrompts();
+    if (rulesOfTools.length === 0) {
+      return "";
+    }
+
+    const lines = rulesOfTools.map(
+      ({ name, toolRulePrompt }) => `- \`${name}\`: ${toolRulePrompt}`
+    );
+
+    return ["## Tools", ...lines].join("\n");
   }
 }

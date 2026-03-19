@@ -30,5 +30,21 @@
   "tools": {
     "restrictToWorkspace": true,
     "mcpServers": []
+  },
+  "eventInspection": {
+    "useEventInspection": false,
+    "showTokenUsage": false,
+    "include": {
+      "agent_start": false,
+      "agent_end": false,
+      "turn_start": false,
+      "turn_end": false,
+      "message_start": false,
+      "message_update": false,
+      "message_end": false,
+      "tool_execution_start": false,
+      "tool_execution_update": false,
+      "tool_execution_end": false
+    }
   }
 }

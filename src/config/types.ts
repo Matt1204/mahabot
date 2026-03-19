@@ -44,11 +44,31 @@ export interface ToolsConfig {
   mcpServers: McpServerConfig[];
 }
 
+export interface EventInspectionIncludeConfig {
+  agent_start: boolean;
+  agent_end: boolean;
+  turn_start: boolean;
+  turn_end: boolean;
+  message_start: boolean;
+  message_update: boolean;
+  message_end: boolean;
+  tool_execution_start: boolean;
+  tool_execution_update: boolean;
+  tool_execution_end: boolean;
+}
+
+export interface EventInspectionConfig {
+  useEventInspection: boolean;
+  showTokenUsage: boolean;
+  include: EventInspectionIncludeConfig;
+}
+
 export interface AppConfig {
   schemaVersion: number;
   ingress: IngressConfig;
   agent: AgentConfig;
   tools: ToolsConfig;
+  eventInspection: EventInspectionConfig;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -80,5 +100,21 @@ export const DEFAULT_CONFIG: AppConfig = {
   tools: {
     restrictToWorkspace: true,
     mcpServers: [],
+  },
+  eventInspection: {
+    useEventInspection: false,
+    showTokenUsage: false,
+    include: {
+      agent_start: false,
+      agent_end: false,
+      turn_start: false,
+      turn_end: false,
+      message_start: false,
+      message_update: false,
+      message_end: false,
+      tool_execution_start: false,
+      tool_execution_update: false,
+      tool_execution_end: false,
+    },
   },
 };

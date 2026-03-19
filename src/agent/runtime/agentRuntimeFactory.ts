@@ -25,13 +25,14 @@ import type { AgentRuntimeConfig } from "../types.js";
 
 export function createAgentRuntime(agentRuntimeconfig: AgentRuntimeConfig): PiAgent {
   const model: Model<any> = agentRuntimeconfig.model;
+  const tools = agentRuntimeconfig.toolRegistry.getTools();
 
   return new PiAgent({
     initialState: {
       systemPrompt: agentRuntimeconfig.systemPrompt,
       model,
       thinkingLevel: agentRuntimeconfig.thinkingLevel,
-      tools: agentRuntimeconfig.tools,
+      tools: tools,
       messages: [],
     },
     convertToLlm: agentRuntimeconfig.convertToLlm ?? defaultConvertToLlm,
@@ -46,6 +47,13 @@ export function createAgentRuntime(agentRuntimeconfig: AgentRuntimeConfig): PiAg
 }
 
 function defaultConvertToLlm(messages: AgentMessage[]): AgentMessage[] {
+  // Beginner note:
+  // This default converter only filters by role; it does NOT strip fields from messages.
+  // So for tool results, both `content` and `details` are kept on the message object
+  // that is passed to the LLM adapter.
+  //
+  // If you want to hide `details` from the LLM (and keep it app-only),
+  // customize `convertToLlm` and explicitly map toolResult messages.
   return messages.filter((message) => {
     const role = (message as any).role;
     return role === "user" || role === "assistant" || role === "toolResult";

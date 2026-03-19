@@ -1,13 +1,15 @@
 import { stdin as input, stdout as output } from "node:process";
 import readline from "node:readline/promises";
 
-import { Agent } from "../agent/index.js";
+import { Agent, EventInspection } from "../agent/index.js";
+import type { InspectionSink } from "../agent/index.js";
+import { assembleTools, ToolRegistry } from "../agent/tools/index.js";
 import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
 
 const DEMO_SESSION_ID = "cli-stable-session";
 const DEMO_PROVIDER_NAME = "microsoft-foundry";
-const DEMO_MODEL_NAME = "gpt-5.3-chat";
+const DEMO_MODEL_NAME = "gpt-5-mini";
 /**
  * Future gateway/external manager entrypoint.
  *
@@ -49,7 +51,7 @@ export class MahabotGatewayManager {
 
     await this.configManager.load();
 
-    let agent = await this.buildAgentFromSession(
+    let agent = await this.buildAgentForSession(
       bootstrap.workspaceSessionId,
       bootstrap.sessionRoot,
       bootstrap.workspaceRoot,
@@ -85,7 +87,7 @@ export class MahabotGatewayManager {
         if (line === "/clear") {
           try {
             await agent.waitForIdle();
-            agent = await this.buildAgentFromSession(
+            agent = await this.buildAgentForSession(
               bootstrap.workspaceSessionId,
               bootstrap.sessionRoot,
               bootstrap.workspaceRoot,
@@ -111,27 +113,49 @@ export class MahabotGatewayManager {
     }
   }
 
-  private async buildAgentFromSession(
-    workspaceSessionId: string,
+  private async buildAgentForSession(
+    sessionId: string,
     sessionRoot: string,
     workspaceRoot: string,
     persistenceRoot: string
   ): Promise<Agent> {
+    const appConfig = this.configManager.get();
+
+    const toolRegistry = new ToolRegistry();
+    assembleTools(toolRegistry, appConfig, { workspaceRoot });
+
     const systemPromptAssembly = await this.contextManager.assembleSystemPrompt(
-      workspaceSessionId,
+      sessionId,
       sessionRoot,
       workspaceRoot,
-      persistenceRoot
+      persistenceRoot,
+      toolRegistry
     );
 
-    return Agent.fromAppConfig(
+    const eventInspection = new EventInspection(appConfig.eventInspection, {
+      sinks: [
+        {
+          channel: "cli",
+          sink: createCliInspectionSink(this.io.output),
+        },
+      ],
+      supportsAnsi: (channel) =>
+        channel === "cli" ? supportsAnsi(this.io.output) : false,
+      logger: {
+        debug: () => {},
+        warn: console.warn,
+        error: console.error,
+      },
+    });
+
+    return Agent.createFromAppConfig(
       {
-        appConfig: this.configManager.get(),
+        appConfig,
         providerName: DEMO_PROVIDER_NAME,
         modelName: DEMO_MODEL_NAME,
         systemPrompt: systemPromptAssembly.systemPrompt,
         thinkingLevel: this.configManager.getThinkingLevel(),
-        tools: [],
+        toolRegistry,
         ensureProviderCredentials: (providerName) =>
           this.configManager.ensureProviderCredentials(providerName),
         getApiKey: (providerName) =>
@@ -148,9 +172,37 @@ export class MahabotGatewayManager {
         outboundSink: async () => {
           // keep outbound in-process for CLI mode
         },
+        onAgentEvent: (event) => {
+          // Realtime inspection is best-effort and must not block turn execution.
+          eventInspection.handleAgentEvent(event);
+        },
       }
     );
   }
+}
+
+function createCliInspectionSink(output: { write: (chunk: string) => unknown }): InspectionSink {
+  return {
+    publish(event) {
+      output.write(`${event.line}\n`);
+    },
+  };
+}
+
+function supportsAnsi(output: { isTTY?: boolean }): boolean {
+  if (process.env.NO_COLOR !== undefined) {
+    return false;
+  }
+
+  if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0") {
+    return true;
+  }
+
+  if (process.env.TERM === "dumb") {
+    return false;
+  }
+
+  return Boolean(output.isTTY);
 }
 
 function isExitCommand(line: string): boolean {

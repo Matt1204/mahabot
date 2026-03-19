@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { AppConfig, LlmProviderConfig } from "./types.js";
+import type { AppConfig, EventInspectionIncludeConfig, LlmProviderConfig } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 
@@ -50,9 +50,9 @@ export class ConfigManager {
 
   async initializeSessionWorkspace(workspaceSessionId: string): Promise<WorkspaceBootstrapResult> {
     const sanitizedSessionId = sanitizeWorkspaceSessionId(workspaceSessionId);
-    const sessionRoot = resolve(homedir(), ".mahaBot", sanitizedSessionId);
+    const sessionRoot = resolve(homedir(), ".mahabot", sanitizedSessionId);
     const workspaceRoot = resolve(sessionRoot, "workspace");
-    const persistenceRoot = resolve(sessionRoot, "persistence");
+    const persistenceRoot = resolve(workspaceRoot, "persistence");
     const configPath = resolve(sessionRoot, "config.json");
 
     await ensureDir(sessionRoot);
@@ -66,8 +66,8 @@ export class ConfigManager {
 
     const isFirstConfigCreated = await copyFileIfMissing(configTemplatePath, configPath);
     await copyFileIfMissing(agentsTemplatePath, resolve(sessionRoot, "AGENTS.md"));
-    await copyFileIfMissing(soulTemplatePath, resolve(sessionRoot, "SOUL.md"));
-    await copyFileIfMissing(userTemplatePath, resolve(sessionRoot, "USER.md"));
+    await copyFileIfMissing(soulTemplatePath, resolve(workspaceRoot, "SOUL.md"));
+    await copyFileIfMissing(userTemplatePath, resolve(workspaceRoot, "USER.md"));
 
     await writeFileIfMissing(resolve(persistenceRoot, "history.md"), "");
     await writeFileIfMissing(resolve(persistenceRoot, "session.jsonl"), "");
@@ -88,7 +88,7 @@ export class ConfigManager {
     sessionRoot: string,
     fileName: PromptScaffoldFileName
   ): Promise<PromptScaffoldResult> {
-    const destinationPath = resolve(sessionRoot, fileName);
+    const destinationPath = resolve(sessionRoot, "workspace", fileName);
     const templatePath = await this.getTemplatePath(fileName);
     const created = await copyFileIfMissing(templatePath, destinationPath);
 
@@ -298,7 +298,48 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: tools.workspaceRoot is no longer supported. Use agent.workspaceRoot.");
   }
 
+  validateEventInspectionConfig(merged.eventInspection);
+
   return merged;
+}
+
+function validateEventInspectionConfig(
+  value: AppConfig["eventInspection"]
+): asserts value is AppConfig["eventInspection"] {
+  if (!isRecord(value)) {
+    throw new Error("Invalid config: eventInspection must be an object.");
+  }
+
+  if (typeof value.useEventInspection !== "boolean") {
+    throw new Error("Invalid config: eventInspection.useEventInspection must be a boolean.");
+  }
+
+  if (typeof value.showTokenUsage !== "boolean") {
+    throw new Error("Invalid config: eventInspection.showTokenUsage must be a boolean.");
+  }
+
+  if (!isRecord(value.include)) {
+    throw new Error("Invalid config: eventInspection.include must be an object.");
+  }
+
+  const includeKeys: Array<keyof EventInspectionIncludeConfig> = [
+    "agent_start",
+    "agent_end",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_update",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+  ];
+
+  for (const key of includeKeys) {
+    if (typeof value.include[key] !== "boolean") {
+      throw new Error(`Invalid config: eventInspection.include.${key} must be a boolean.`);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
