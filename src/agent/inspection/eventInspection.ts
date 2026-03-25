@@ -27,6 +27,12 @@ export interface EventInspectionDeps {
   supportsAnsi?: (channel: InspectionChannel) => boolean;
 }
 
+/**
+ * Subscribes to AgentEvent stream (via Agent.onAgentEvent). Two-stage microtask deferral:
+ * (1) handleAgentEvent → queueMicrotask(processEvent) so the runtime's subscribe callback returns fast;
+ * (2) per rendered line → queueMicrotask(sink.publish) so synchronous terminal I/O does not run on
+ * the same tick as processEvent. Complements docs/progress_sink_and_inspection_sink.md sequence diagram.
+ */
 export class EventInspection {
   private readonly logger: Pick<Console, "debug" | "warn" | "error">;
   private readonly now: () => number;

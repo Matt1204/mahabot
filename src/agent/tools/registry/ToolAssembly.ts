@@ -1,6 +1,10 @@
 import type { AppConfig } from "../../../config/types.js";
+import type { InFlightUpdateQuotaRef, ProgressUpdateSink } from "../../progress/types.js";
 import { createBashTool } from "../bashTool.js";
+import { createInFlightUpdateTool } from "../inFlightUpdateTool.js";
 import { createEditFileTool } from "../editFileTool.js";
+import { createGrepTool } from "../grepTool.js";
+import { createGlobTool } from "../globTool.js";
 import { createListTreeTool } from "../listTreeTool.js";
 import { createReadFileTool } from "../readFileTool.js";
 import { createWriteFileTool } from "../writeFileTool.js";
@@ -14,6 +18,15 @@ import type { ToolRegistry } from "./toolRegistry.js";
 
 export interface ToolRuntimeContext {
   workspaceRoot?: string;
+  /**
+   * When set, registers `in_flight_update` with this sink and quota ref (gateway must pass the same
+   * quotaRef to Agent.createFromAppConfig deps so invokeAgentLoop resets `used` each turn).
+   * Omit in environments that should not expose user-visible progress lines.
+   */
+  progressUpdate?: {
+    sink: ProgressUpdateSink;
+    quotaRef: InFlightUpdateQuotaRef;
+  };
 }
 
 /**
@@ -38,6 +51,14 @@ function registerStandardTools(
   toolRuntimeContext: ToolRuntimeContext
 ): void {
   registry.registerStandard(createShowRuntimeInfoTool());
+  if (toolRuntimeContext.progressUpdate) {
+    registry.registerStandard(
+      createInFlightUpdateTool({
+        sink: toolRuntimeContext.progressUpdate.sink,
+        quotaRef: toolRuntimeContext.progressUpdate.quotaRef,
+      })
+    );
+  }
   // Bash needs an explicit workspace root to enforce path-boundary checks.
   // In fallback construction paths without this context, we intentionally skip Bash.
   if (toolRuntimeContext.workspaceRoot) {
@@ -49,6 +70,18 @@ function registerStandardTools(
     );
     registry.registerStandard(
       createReadFileTool({
+        workspaceRoot: toolRuntimeContext.workspaceRoot,
+        restrictToWorkspace: appConfig.tools.restrictToWorkspace,
+      })
+    );
+    registry.registerStandard(
+      createGrepTool({
+        workspaceRoot: toolRuntimeContext.workspaceRoot,
+        restrictToWorkspace: appConfig.tools.restrictToWorkspace,
+      })
+    );
+    registry.registerStandard(
+      createGlobTool({
         workspaceRoot: toolRuntimeContext.workspaceRoot,
         restrictToWorkspace: appConfig.tools.restrictToWorkspace,
       })
@@ -72,10 +105,6 @@ function registerStandardTools(
       })
     );
   }
-  // registry.registerStandard(createEchoStructuredInputTool());
-  // registry.registerStandard(createProgressiveTickerTool());
-  // registry.registerStandard(createRenderDebugBadgeTool());
-  // registry.registerStandard(createFailIntentionallyTool());
 }
 
 function registerAddonTools(

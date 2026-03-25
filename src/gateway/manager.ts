@@ -4,6 +4,7 @@ import readline from "node:readline/promises";
 import { Agent, EventInspection } from "../agent/index.js";
 import type { InspectionSink } from "../agent/index.js";
 import { assembleTools, ToolRegistry } from "../agent/tools/index.js";
+import { createCliProgressUpdateSink } from "./progress/cliProgressSink.js";
 import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
 
@@ -121,8 +122,21 @@ export class MahabotGatewayManager {
   ): Promise<Agent> {
     const appConfig = this.configManager.get();
 
+    // Progress path (docs/progress_sink_and_inspection_sink.md): `in_flight_update` is wired here only.
+    // - `quotaRef` is shared with Agent (passed below) so Agent.invokeAgentLoop can reset `used` each turn;
+    //   the tool increments `used` on successful sink delivery.
+    // - `progressSink` is independent of EventInspection / AgentEvent; it is not an InspectionSink.
+    const progressUpdateQuotaRef = { used: 0 };
+    const progressSink = createCliProgressUpdateSink(
+      this.io.output,
+      supportsAnsi(this.io.output)
+    );
+
     const toolRegistry = new ToolRegistry();
-    assembleTools(toolRegistry, appConfig, { workspaceRoot });
+    assembleTools(toolRegistry, appConfig, {
+      workspaceRoot,
+      progressUpdate: { quotaRef: progressUpdateQuotaRef, sink: progressSink },
+    });
 
     const systemPromptAssembly = await this.contextManager.assembleSystemPrompt(
       sessionId,
@@ -132,6 +146,9 @@ export class MahabotGatewayManager {
       toolRegistry
     );
 
+    // Inspection path: subscribe to runtime AgentEvent stream via `onAgentEvent` (see Agent constructor).
+    // EventInspection filters by appConfig.eventInspection, renders `[inspection]` lines, and calls
+    // InspectionSink.publish — see eventInspection.ts for microtask deferral.
     const eventInspection = new EventInspection(appConfig.eventInspection, {
       sinks: [
         {
@@ -173,14 +190,17 @@ export class MahabotGatewayManager {
           // keep outbound in-process for CLI mode
         },
         onAgentEvent: (event) => {
-          // Realtime inspection is best-effort and must not block turn execution.
+          // Forwards pi-agent-core AgentEvent to EventInspection.handleAgentEvent, which immediately
+          // returns after queueMicrotask (heavy work + sink.publish are deferred — see eventInspection.ts).
           eventInspection.handleAgentEvent(event);
         },
+        progressUpdateQuotaRef,
       }
     );
   }
 }
 
+// Minimal InspectionSink for CLI: one rendered line per publish (prefix already in `event.line`).
 function createCliInspectionSink(output: { write: (chunk: string) => unknown }): InspectionSink {
   return {
     publish(event) {

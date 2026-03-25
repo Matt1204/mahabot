@@ -8,7 +8,7 @@ import { Type } from "@mariozechner/pi-ai";
 import type { DescribedAgentTool } from "./registry/types.js";
 import { textResult } from "./showcase/shared.js";
 
-const BASH_TIMEOUT_MS = 60_000;
+const BASH_TIMEOUT_MS = 120_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
 const STDERR_MAX_BYTES = 8 * 1024;
 const STDOUT_TAIL_BYTES = 32 * 1024;
@@ -663,7 +663,7 @@ function buildToolRulePrompt(input: { workspaceRoot: string; restrictToWorkspace
     ? [
         "### Workspace Restriction",
         `- Workspace restriction is ON. You must only access files under: ${input.workspaceRoot}`,
-        "- Commands that are cannot be verified as workspace-safe will be rejected.",
+        "- Commands that cannot be verified as workspace-safe will be rejected.",
         "",
       ].join("\n")
     : "";
@@ -677,10 +677,12 @@ function buildToolRulePrompt(input: { workspaceRoot: string; restrictToWorkspace
     "IMPORTANT: Avoid using Bash tool for tasks covered by dedicated tools unless the user explicitly instructs it, or you have verified that a dedicated tool cannot accomplish the task.",
     "Using dedicated tools provides a better user experience and makes tool-call review/permission flows clearer.",
     "- Read files: use `read_file` (NOT `cat`, `head`, `tail`).",
+    "- Search file contents: use `grep` (NOT `grep`, `rg`, or `find ... | xargs grep`).",
+    "- Identifier lookup / definition-usages / text search: prefer `grep` before Bash.",
+    "- Pathname pattern matching / file discovery: use `glob` (NOT `find` or `rg --files`).",
     "- Edit files: use `edit_file` (NOT `sed`, `awk`).",
     "- Write files: use `write_file` (NOT `echo >`, `cat <<EOF`).",
     "- List directory structure: use `list_tree`.",
-    "- Communication: output text directly in assistant response (NOT `echo`/`printf`).",
     "",
     "### Instructions",
     "- If your command will create new directories or files, first use this tool to run `ls` to verify the parent directory exists and is the correct location.",

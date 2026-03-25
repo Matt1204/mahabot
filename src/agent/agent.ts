@@ -18,6 +18,7 @@ import type {
   MemoryBundle,
   OutboundMessageTemp,
 } from "./types.js";
+import type { InFlightUpdateQuotaRef } from "./progress/types.js";
 
 export class Agent {
   private readonly agentRuntime: PiAgentRuntime;
@@ -27,6 +28,7 @@ export class Agent {
   private readonly outboundSink?: (message: OutboundMessageTemp) => Promise<void> | void;
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   private readonly onAgentEvent?: (event: AgentEvent) => void;
+  private readonly progressUpdateQuotaRef?: InFlightUpdateQuotaRef;
 
   private running = false;
   private loopAbortController: AbortController | null = null;
@@ -69,8 +71,10 @@ export class Agent {
     this.outboundSink = deps.outboundSink;
     this.memoryAssembler = deps.memoryAssembler;
     this.onAgentEvent = deps.onAgentEvent;
+    this.progressUpdateQuotaRef = deps.progressUpdateQuotaRef;
 
     // Keep this subscription always on so the playground can observe full event flow.
+    // `onAgentEvent` feeds EventInspection → InspectionSink (parallel to tools → ProgressUpdateSink).
     this.agentRuntime.subscribe((event) => {
       this.logger.debug(`[pi-mono event] ${String((event as any).type)}`);
       try {
@@ -167,6 +171,11 @@ export class Agent {
   }
 
   async invokeAgentLoop(messages: AgentMessage[]): Promise<AgentMessage> {
+    // Same mutable object as gateway's `progressUpdateQuotaRef` + assembleTools; reset once per
+    // prompt() so `in_flight_update` quota applies per user turn, not across turns.
+    if (this.progressUpdateQuotaRef) {
+      this.progressUpdateQuotaRef.used = 0;
+    }
     await this.agentRuntime.prompt(messages);
 
     const assistantMessage = [...this.agentRuntime.state.messages]

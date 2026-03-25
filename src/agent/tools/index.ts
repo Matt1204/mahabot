@@ -1,5 +1,7 @@
 export { createPiMonoShowcaseTools } from "./piMonoShowcaseTools.js";
 export { createEditFileTool } from "./editFileTool.js";
+export { createGrepTool } from "./grepTool.js";
+export { createGlobTool } from "./globTool.js";
 export { createListTreeTool } from "./listTreeTool.js";
 export { createReadFileTool } from "./readFileTool.js";
 export { createWriteFileTool } from "./writeFileTool.js";

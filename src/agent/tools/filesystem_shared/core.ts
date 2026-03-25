@@ -3,7 +3,7 @@ import { access, appendFile, open, readFile, realpath, rename, stat, writeFile }
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 
-export type FsToolName = "read_file" | "write_file" | "edit_file" | "list_tree";
+export type FsToolName = "read_file" | "write_file" | "edit_file" | "list_tree" | "grep" | "glob";
 
 export type FsErrorCode =
   | "invalid_path"
@@ -11,6 +11,8 @@ export type FsErrorCode =
   | "not_found"
   | "not_file"
   | "not_directory"
+  | "invalid_regex"
+  | "invalid_glob"
   | "encoding_error"
   | "invalid_offset"
   | "invalid_occurrence"
