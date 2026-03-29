@@ -45,9 +45,10 @@ function quotaSnapshot(used: number) {
 
 function buildToolRulePrompt(): string {
   return [
-    "Send a **non-final** progress update to the user during long or multi-step work.",
-    `At most **${IN_FLIGHT_UPDATE_LIMIT}** successful updates per user turn; check tool result \`quota.remaining\`.`,
-    "This is not the final answer — continue until you output the full reply for the user turn.",
+    "Send a **non-final** progress update to the user during multi-step work.",
+    "This is not the final answer, this is just a 'by the way' to inform user your plan, progress, and difficulty.",
+    "You are encouraged to send updates frequently.",
+    "Use this tool in parallel with other tools.",
     "Do not use for trivial one-shot tasks.",
   ].join(" ");
 }

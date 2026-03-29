@@ -1,0 +1,155 @@
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+
+import { ConfigManager } from "../../src/config/configManager.ts";
+import { createModelFromConfig } from "../../src/config/modelFactory.ts";
+import { DEFAULT_CONFIG, type AppConfig } from "../../src/config/types.ts";
+
+function cloneConfig(): AppConfig {
+  return JSON.parse(JSON.stringify(DEFAULT_CONFIG)) as AppConfig;
+}
+
+describe("config slimming validation", () => {
+  test("accepts slim model overrides only", () => {
+    const config = cloneConfig();
+    config.agent.activeProvider = "openai";
+    config.agent.activeModel = "gpt-4o-mini";
+    config.agent.defaultProvider = "openai";
+    config.agent.defaultModel = "gpt-4o-mini";
+    config.agent.llmProviders = [
+      {
+        provider: "openai",
+        enabled: true,
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        models: [
+          {
+            name: "gpt-4o-mini",
+            params: {
+              model: {
+                reasoning: true,
+                input: ["text", "image"],
+                headers: { "X-Test": "1" },
+                compat: { supportsStore: true },
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    const manager = new ConfigManager();
+    const normalized = manager.set(config);
+
+    const modelParams = normalized.agent.llmProviders[0]?.models[0]?.params?.model;
+    assert.equal(modelParams?.reasoning, true);
+    assert.deepEqual(modelParams?.input, ["text", "image"]);
+    assert.equal(modelParams?.headers?.["X-Test"], "1");
+  });
+
+  test("rejects removed params.agent and params.stream", () => {
+    const config = cloneConfig() as any;
+    config.agent.llmProviders[0].models = [
+      {
+        name: "gpt-4o-mini",
+        params: {
+          agent: { thinkingLevel: "high" },
+        },
+      },
+    ];
+
+    const manager = new ConfigManager();
+    assert.throws(
+      () => manager.set(config),
+      /params\.agent is removed/
+    );
+
+    config.agent.llmProviders[0].models = [
+      {
+        name: "gpt-4o-mini",
+        params: {
+          stream: { temperature: 0.2 },
+        },
+      },
+    ];
+    assert.throws(
+      () => manager.set(config),
+      /params\.stream is removed/
+    );
+  });
+
+  test("rejects unknown and removed params.model keys", () => {
+    const config = cloneConfig() as any;
+    config.agent.llmProviders[0].models = [
+      {
+        name: "gpt-4o-mini",
+        params: {
+          model: {
+            randomKey: true,
+          },
+        },
+      },
+    ];
+
+    const manager = new ConfigManager();
+    assert.throws(
+      () => manager.set(config),
+      /params\.model\.randomKey is not supported/
+    );
+
+    config.agent.llmProviders[0].models = [
+      {
+        name: "gpt-4o-mini",
+        params: {
+          model: {
+            baseUrl: "https://example.com/v1",
+          },
+        },
+      },
+    ];
+    assert.throws(
+      () => manager.set(config),
+      /params\.model\.baseUrl is removed/
+    );
+  });
+});
+
+describe("modelFactory fallback order", () => {
+  test("uses requested -> active -> default fallback order", () => {
+    const config = cloneConfig();
+    config.agent.activeProvider = "openai";
+    config.agent.activeModel = "gpt-4o-mini";
+    config.agent.defaultProvider = "openai";
+    config.agent.defaultModel = "gpt-4o";
+    config.agent.llmProviders = [
+      {
+        provider: "openai",
+        enabled: true,
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        models: [{ name: "gpt-4o-mini" }, { name: "gpt-4o" }],
+      },
+    ];
+
+    const modelFromMissingRequested = createModelFromConfig(config, "openai", "non-existent");
+    assert.equal(modelFromMissingRequested.id, "gpt-4o-mini");
+
+    const modelFromNoRequest = createModelFromConfig(config);
+    assert.equal(modelFromNoRequest.id, "gpt-4o-mini");
+
+    const configWithMissingActive = cloneConfig();
+    configWithMissingActive.agent.activeProvider = "openai";
+    configWithMissingActive.agent.activeModel = "non-existent";
+    configWithMissingActive.agent.defaultProvider = "openai";
+    configWithMissingActive.agent.defaultModel = "gpt-4o-mini";
+    configWithMissingActive.agent.llmProviders = [
+      {
+        provider: "openai",
+        enabled: true,
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        models: [{ name: "gpt-4o-mini" }],
+      },
+    ];
+
+    const modelFromDefaultFallback = createModelFromConfig(configWithMissingActive as AppConfig);
+    assert.equal(modelFromDefaultFallback.id, "gpt-4o-mini");
+  });
+});

@@ -12,6 +12,7 @@ const BASH_TIMEOUT_MS = 120_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
 const STDERR_MAX_BYTES = 8 * 1024;
 const STDOUT_TAIL_BYTES = 32 * 1024;
+const BASH_DEBUG_ENV_VAR = "MAHABOT_BASH_TOOL_DEBUG";
 
 // Policy layer 1: always-block destructive system commands.
 const GENERAL_COMMAND_BLACKLIST: RegExp[] = [
@@ -63,6 +64,28 @@ interface BashToolResult {
   blockedReason?: string;
 }
 
+function isBashToolDebugEnabled(): boolean {
+  const raw = process.env[BASH_DEBUG_ENV_VAR]?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function truncateForDebug(value: string, max = 200): string {
+  if (value.length <= max) {
+    return value;
+  }
+
+  return `${value.slice(0, max)}...[truncated ${value.length - max} chars]`;
+}
+
+function debugLog(stage: string, payload: Record<string, unknown>): void {
+  if (!isBashToolDebugEnabled()) {
+    return;
+  }
+
+  const kvPairs = Object.entries(payload).map(([key, value]) => `${key}=${String(value)}`);
+  console.warn(`[bash_tool_debug] stage=${stage}${kvPairs.length ? ` ${kvPairs.join(" ")}` : ""}`);
+}
+
 export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
   const workspaceRoot = resolve(input.workspaceRoot);
   const restrictToWorkspace = input.restrictToWorkspace;
@@ -88,8 +111,20 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       const toolDescription = normalizeInput(params.toolDescription);
       const normalizedCommand = command.normalize("NFKC");
       const workspaceRootCanonical = await toPolicyPath(workspaceRoot);
+      debugLog("execute_start", {
+        toolCallId,
+        restrictToWorkspace,
+        workspaceRoot: workspaceRootCanonical,
+        requestedWorkingDir: params.working_dir ?? "(empty)",
+        currentWorkingDir,
+        commandPreview: truncateForDebug(command),
+      });
 
       if (!command) {
+        debugLog("blocked_empty_command", {
+          toolCallId,
+          workspaceRoot: workspaceRootCanonical,
+        });
         return blockedResult(
           toolDescription,
           command,
@@ -110,6 +145,12 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       // Check 1: block blacklisted and high risk commands
       const commandPolicyReason = getCommandPolicyReason(normalizedCommand);
       if (commandPolicyReason) {
+        debugLog("blocked_command_policy", {
+          toolCallId,
+          commandPolicyReason,
+          effectiveWorkingDir: effectiveWorkingDirCanonical,
+          commandPreview: truncateForDebug(normalizedCommand),
+        });
         return blockedResult(
           toolDescription,
           command,
@@ -129,6 +170,12 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         );
 
         if (workspaceReason) {
+          debugLog("blocked_workspace_policy", {
+            toolCallId,
+            workspaceReason,
+            workspaceRoot: workspaceRootCanonical,
+            effectiveWorkingDir: effectiveWorkingDirCanonical,
+          });
           return blockedResult(
             toolDescription,
             command,
@@ -146,6 +193,18 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         cwd: effectiveWorkingDirCanonical,
         signal,
       });
+      debugLog("execution_done", {
+        toolCallId,
+        effectiveWorkingDir: effectiveWorkingDirCanonical,
+        nextWorkingDirFromShell: execution.nextWorkingDir ?? "(null)",
+        exitCode: execution.exitCode === null ? "null" : execution.exitCode,
+        timedOut: execution.timedOut,
+        durationMs: execution.durationMs,
+        stdoutBytes: execution.stdout.bytes,
+        stderrBytes: execution.stderr.bytes,
+        stdoutTruncated: execution.stdout.truncated,
+        stderrTruncated: execution.stderr.truncated,
+      });
 
       const nextWorkingDir = await resolveNextWorkingDir(
         execution.nextWorkingDir,
@@ -153,6 +212,12 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       );
 
       if (restrictToWorkspace && !isWithin(workspaceRootCanonical, nextWorkingDir)) {
+        debugLog("blocked_next_working_dir", {
+          toolCallId,
+          workspaceRoot: workspaceRootCanonical,
+          nextWorkingDir,
+          fallbackWorkingDir: effectiveWorkingDirCanonical,
+        });
         return blockedResult(
           toolDescription,
           command,
@@ -164,6 +229,10 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       }
 
       currentWorkingDir = nextWorkingDir;
+      debugLog("execute_success", {
+        toolCallId,
+        nextWorkingDir,
+      });
 
       return textResult(
         formatBashOutput(toolDescription, command, execution.stdout, execution.stderr, {
@@ -407,6 +476,12 @@ async function runCommand(input: {
   ].join("\n");
 
   const shellExecutable = process.env.SHELL?.trim() || "/bin/bash";
+  debugLog("run_command_spawn", {
+    toolCallId: input.toolCallId,
+    shell: shellExecutable,
+    cwd: input.cwd,
+    commandPreview: truncateForDebug(input.command),
+  });
   const child = spawn(shellExecutable, ["-lc", wrappedCommand], {
     cwd: input.cwd,
     env: process.env,
@@ -481,15 +556,28 @@ async function runCommand(input: {
   // Expected behavior: timedOut=true only when timeout path triggers.
   const timeoutTimer = setTimeout(() => {
     timedOut = true;
+    debugLog("run_command_timeout_sigterm", {
+      toolCallId: input.toolCallId,
+      timeoutMs: BASH_TIMEOUT_MS,
+    });
     child.kill("SIGTERM");
     forceKillHandle.timer = setTimeout(() => {
+      debugLog("run_command_timeout_sigkill", {
+        toolCallId: input.toolCallId,
+      });
       child.kill("SIGKILL");
     }, 300);
   }, BASH_TIMEOUT_MS);
 
   const abortHandler = () => {
+    debugLog("run_command_abort", {
+      toolCallId: input.toolCallId,
+    });
     child.kill("SIGTERM");
     forceKillHandle.timer = setTimeout(() => {
+      debugLog("run_command_abort_sigkill", {
+        toolCallId: input.toolCallId,
+      });
       child.kill("SIGKILL");
     }, 300);
   };
@@ -539,6 +627,15 @@ async function runCommand(input: {
   const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const markerRegex = new RegExp(`${escapedMarker}([^\\n\\r]+)`);
   const markerMatch = Buffer.from(stdoutTail).toString("utf-8").match(markerRegex)?.[1]?.trim() ?? null;
+  debugLog("run_command_close", {
+    toolCallId: input.toolCallId,
+    exitCode: closeInfo.exitCode === null ? "null" : closeInfo.exitCode,
+    timedOut,
+    markerFound: markerMatch ? "true" : "false",
+    markerPreview: markerMatch ? truncateForDebug(markerMatch) : "(null)",
+    stdoutTotalBytes,
+    stderrTotalBytes,
+  });
 
   // Build returned stdout/stderr text:
   // - decode captured chunks

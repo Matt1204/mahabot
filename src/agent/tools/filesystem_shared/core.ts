@@ -15,6 +15,7 @@ export type FsErrorCode =
   | "invalid_glob"
   | "encoding_error"
   | "invalid_offset"
+  | "invalid_max_bytes"
   | "invalid_occurrence"
   | "ambiguous_match"
   | "precondition_failed"
@@ -56,6 +57,7 @@ export interface ResolvePolicyPathInput {
   workspaceRoot: string;
   restrictToWorkspace: boolean;
   baseDir?: string;
+  additionalAllowedRoots?: string[];
 }
 
 export async function resolvePolicyPath(input: ResolvePolicyPathInput): Promise<{ resolvedPath: string }> {
@@ -69,7 +71,7 @@ export async function resolvePolicyPath(input: ResolvePolicyPathInput): Promise<
   const absolutePath = isAbsolute(cleanedInput) ? resolve(cleanedInput) : resolve(baseDir, cleanedInput);
   const resolvedPath = await toPolicyPathWithExistingAncestor(absolutePath);
 
-  if (input.restrictToWorkspace && !isWithin(workspaceRootCanonical, resolvedPath)) {
+  if (input.restrictToWorkspace && !(await isAllowedPath(workspaceRootCanonical, resolvedPath, input.additionalAllowedRoots))) {
     throw new FsToolError(
       "outside_workspace",
       `Path is outside workspace: ${cleanedInput}`,
@@ -78,6 +80,34 @@ export async function resolvePolicyPath(input: ResolvePolicyPathInput): Promise<
   }
 
   return { resolvedPath };
+}
+
+async function isAllowedPath(
+  workspaceRootCanonical: string,
+  resolvedPath: string,
+  additionalAllowedRoots: string[] | undefined
+): Promise<boolean> {
+  if (isWithin(workspaceRootCanonical, resolvedPath)) {
+    return true;
+  }
+
+  if (!additionalAllowedRoots || additionalAllowedRoots.length === 0) {
+    return false;
+  }
+
+  for (const root of additionalAllowedRoots) {
+    const normalizedRoot = root.trim();
+    if (!normalizedRoot) {
+      continue;
+    }
+
+    const canonicalRoot = await toPolicyPath(resolve(normalizedRoot));
+    if (isWithin(canonicalRoot, resolvedPath)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export async function assertFilePath(pathValue: string): Promise<void> {

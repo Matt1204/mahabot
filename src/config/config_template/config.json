@@ -8,18 +8,25 @@
     }
   },
   "agent": {
+    "activeProvider": "openai",
+    "activeModel": "gpt-4o-mini",
     "defaultProvider": "openai",
     "defaultModel": "gpt-4o-mini",
     "systemPromptFile": "AGENTS.md",
     "workspaceRoot": "./workspace",
     "memoryWindow": 50,
+    "startupRestoreMessageCount": 50,
+    "compactHighWatermarkTokens": 100000,
+    "compactLowWatermarkTokens": 40000,
     "maxTokens": 4096,
     "thinkingLevel": "off",
     "llmProviders": [
       {
         "provider": "openai",
         "models": [
-          "gpt-4o-mini"
+          {
+            "name": "gpt-4o-mini"
+          }
         ],
         "enabled": true,
         "apiKeyEnvVar": "OPENAI_API_KEY",
@@ -29,7 +36,11 @@
   },
   "tools": {
     "restrictToWorkspace": true,
-    "mcpServers": []
+    "mcpServers": [],
+    "webSearch": {
+      "tavilyApiKeyEnvVar": "TAVILY_API_KEY",
+      "linkupApiKeyEnvVar": "LINKUP_API_KEY"
+    }
   },
   "eventInspection": {
     "useEventInspection": false,

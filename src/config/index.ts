@@ -7,6 +7,8 @@ export type {
   EventInspectionConfig,
   EventInspectionIncludeConfig,
   IngressConfig,
+  LlmModelConfig,
+  ModelFactoryModelOverridesConfig,
   LlmProviderConfig as LlmProvider,
   LlmProviderConfig as LlmProviderCredential,
   McpServerConfig,

@@ -19,6 +19,10 @@ import type {
   OutboundMessageTemp,
 } from "./types.js";
 import type { InFlightUpdateQuotaRef } from "./progress/types.js";
+import {
+  MessagePersistenceCoordinator,
+  type ContextBudgetSnapshot,
+} from "./persistence/messagePersistenceCoordinator.js";
 
 export class Agent {
   private readonly agentRuntime: PiAgentRuntime;
@@ -29,10 +33,12 @@ export class Agent {
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   private readonly onAgentEvent?: (event: AgentEvent) => void;
   private readonly progressUpdateQuotaRef?: InFlightUpdateQuotaRef;
+  private readonly messagePersistenceCoordinator?: MessagePersistenceCoordinator;
 
   private running = false;
   private loopAbortController: AbortController | null = null;
   private serialQueue: Promise<void> = Promise.resolve();
+  private readonly persistedContextLoadPromise: Promise<void>;
 
   /**
    * Static builder for composing runtime dependencies from app-level config.
@@ -72,13 +78,40 @@ export class Agent {
     this.memoryAssembler = deps.memoryAssembler;
     this.onAgentEvent = deps.onAgentEvent;
     this.progressUpdateQuotaRef = deps.progressUpdateQuotaRef;
+    this.messagePersistenceCoordinator = deps.messagePersistence
+      ? new MessagePersistenceCoordinator(deps.messagePersistence, {
+          logger: this.logger,
+        })
+      : undefined;
+
+    // Load persisted context exactly once as part of startup, right after runtime/deps are ready.
+    this.persistedContextLoadPromise = this.restorePersistedContextOnStartup();
+    // Ensure first queued turn waits for startup restore before prompt().
+    this.serialQueue = this.persistedContextLoadPromise.then(
+      () => undefined,
+      () => undefined
+    );
 
     // Keep this subscription always on so the playground can observe full event flow.
     // `onAgentEvent` feeds EventInspection → InspectionSink (parallel to tools → ProgressUpdateSink).
     this.agentRuntime.subscribe((event) => {
       this.logger.debug(`[pi-mono event] ${String((event as any).type)}`);
+      let eventForInspection: AgentEvent = event;
+
+      // Count token usage for context compaction and include a user-facing context budget snapshot.
+      if (event.type === "turn_end") {
+        const totalTokens = extractTotalTokens(event.message);
+        if (totalTokens !== undefined) {
+          const contextBudget = this.messagePersistenceCoordinator?.noteTurnUsage(totalTokens);
+          if (contextBudget) {
+            eventForInspection = attachContextBudget(event, contextBudget);
+          }
+        }
+      }
+
+      // event inspection
       try {
-        this.onAgentEvent?.(event);
+        this.onAgentEvent?.(eventForInspection);
       } catch (error) {
         // Never let inspection/event observers break agent loop execution.
         this.logger.warn(`[agent event observer error] ${String(error)}`);
@@ -127,11 +160,14 @@ export class Agent {
   }
 
   async stop(): Promise<void> {
+    await this.persistedContextLoadPromise;
+    await this.persistPendingMessages();
     this.running = false;
     this.loopAbortController?.abort();
     this.loopAbortController = null;
     this.agentRuntime.abort();
     await this.agentRuntime.waitForIdle();
+    await this.persistPendingMessages();
   }
 
   async checkAndWaitInboundMessage(signal?: AbortSignal): Promise<InboundMessageTemp | null> {
@@ -177,6 +213,7 @@ export class Agent {
       this.progressUpdateQuotaRef.used = 0;
     }
     await this.agentRuntime.prompt(messages);
+    await this.ensureContextSize();
 
     const assistantMessage = [...this.agentRuntime.state.messages]
       .reverse()
@@ -278,8 +315,73 @@ export class Agent {
   reset(): void {
     this.agentRuntime.reset();
   }
+
+  private async restorePersistedContextOnStartup(): Promise<void> {
+    if (!this.messagePersistenceCoordinator) {
+      return;
+    }
+
+    try {
+      const loaded = await this.messagePersistenceCoordinator.loadPersistedContextWindow(
+        this.agentRuntime.state.messages
+      );
+      this.agentRuntime.replaceMessages(loaded.messages);
+    } catch (error) {
+      // Defensive catch: coordinator already handles IO failures internally.
+      this.logger.warn(`[message persistence] startup restore failed: ${String(error)}`);
+    }
+  }
+
+  // after an agent turn, check if compact context.
+  private async ensureContextSize(): Promise<void> {
+    if (!this.messagePersistenceCoordinator) {
+      return;
+    }
+
+    const compactedMessages = await this.messagePersistenceCoordinator.compactContextIfNeeded(
+      this.agentRuntime.state.messages
+    );
+    if (!compactedMessages.didCompact) {
+      return;
+    }
+
+    this.agentRuntime.replaceMessages(compactedMessages.messages);
+  }
+
+  private async persistPendingMessages(): Promise<void> {
+    if (!this.messagePersistenceCoordinator) {
+      return;
+    }
+
+    await this.messagePersistenceCoordinator.persistPendingMessages(this.agentRuntime.state.messages);
+  }
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractTotalTokens(message: AgentMessage): number | undefined {
+  if (
+    message &&
+    typeof message === "object" &&
+    "usage" in message &&
+    typeof message.usage === "object" &&
+    message.usage !== null &&
+    "totalTokens" in message.usage &&
+    typeof message.usage.totalTokens === "number"
+  ) {
+    return message.usage.totalTokens;
+  }
+  return undefined;
+}
+
+function attachContextBudget(
+  event: Extract<AgentEvent, { type: "turn_end" }>,
+  contextBudget: ContextBudgetSnapshot
+): AgentEvent {
+  return {
+    ...event,
+    contextBudget,
+  } as AgentEvent;
 }

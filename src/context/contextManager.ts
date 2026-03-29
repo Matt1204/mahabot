@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import { renderSkillsPromptSection, resolveBuiltinSkillsRoot, SkillsCatalogService } from "../agent/skills/index.js";
 import type { ToolRegistry } from "../agent/tools/registry/toolRegistry.js";
 import type { ConfigManager, PromptScaffoldFileName } from "../config/configManager.js";
 import type { ContextAssemblyResult, PromptSection } from "./types.js";
@@ -10,7 +11,8 @@ type ContextLogger = Pick<Console, "debug" | "warn" | "error">;
 export class ContextManager {
   constructor(
     private readonly configManager: ConfigManager,
-    private readonly logger: ContextLogger = console
+    private readonly logger: ContextLogger = console,
+    private readonly skillsCatalogService: SkillsCatalogService = new SkillsCatalogService()
   ) {}
 
   async assembleSystemPrompt(
@@ -45,6 +47,11 @@ export class ContextManager {
       "Template recovery was attempted. Verify file permissions and template availability."
     );
 
+    const skillsSummary = await this.skillsCatalogService.buildSkillsSummary({
+      workspaceSkillsRoot: resolve(workspaceRoot, "skills"),
+      builtinSkillsRoot: resolveBuiltinSkillsRoot(),
+    });
+
     const sections: PromptSection[] = [
       { id: "agents", required: true, content: agents.trim() },
       {
@@ -64,12 +71,26 @@ export class ContextManager {
       },
       { id: "soul", required: false, content: soul.trim() },
       { id: "user", required: false, content: user.trim() },
+      {
+        id: "skills",
+        required: false,
+        content: renderSkillsPromptSection(skillsSummary.skills),
+      },
     ];
 
     const systemPrompt = sections
       .map((section) => section.content)
       .filter((content) => content.length > 0)
       .join("\n\n");
+
+    this.logger.debug(
+      `[skills_catalog] scanned=${skillsSummary.stats.scanned} loaded=${skillsSummary.stats.loaded} skipped=${skillsSummary.stats.skipped} warnings=${skillsSummary.warnings.length}`
+    );
+    for (const warning of skillsSummary.warnings) {
+      this.logger.warn(
+        `[skills_catalog] code=${warning.code} location=${warning.location} message=${warning.message}`
+      );
+    }
 
     this.logger.debug(
       `[context_manager] assembled prompt from ${sessionRoot} (${systemPrompt.length} chars)`

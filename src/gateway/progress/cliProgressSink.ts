@@ -3,7 +3,7 @@ import type { AgentProgressUpdatePayload, ProgressUpdateSink } from "../../agent
 /**
  * CLI implementation of ProgressUpdateSink (docs/progress_sink_and_inspection_sink.md).
  * - Called synchronously from `in_flight_update` execute(); must stay fast (stdout write only).
- * - Output prefix `[agent-update]` distinguishes from EventInspection's `[inspection]`.
+ * - Output prefix `[agent-update]` distinguishes from EventInspection's `[event_name]`.
  */
 export function createCliProgressUpdateSink(
   output: { write: (chunk: string) => unknown },

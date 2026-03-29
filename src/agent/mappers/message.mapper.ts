@@ -92,6 +92,9 @@ export function extractTextForHuman(message: AgentMessage): string {
     if (toolCalls.length > 0) {
       return `[agent] Assistant requested ${toolCalls.length} tool call(s).`;
     }
+
+    // Thinking blocks are internal reasoning content and should not be shown
+    // as user-facing assistant output in CLI.
   }
 
   return "[agent] Assistant returned no text.";

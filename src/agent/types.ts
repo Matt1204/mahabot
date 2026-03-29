@@ -58,6 +58,15 @@ export interface AgentFromAppConfigInput {
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 }
 
+export interface MessagePersistenceConfig {
+  enabled: boolean;
+  sessionId: string;
+  sessionJsonlPath: string;
+  startupRestoreMessageCount: number;
+  compactHighWatermarkTokens: number;
+  compactLowWatermarkTokens: number;
+}
+
 export interface AgentDependencies {
   inboundSource?: (signal?: AbortSignal) => Promise<InboundMessageTemp | null>;
   outboundSink?: (message: OutboundMessageTemp) => Promise<void> | void;
@@ -67,6 +76,7 @@ export interface AgentDependencies {
   onAgentEvent?: (event: AgentEvent) => void;
   /** When set with `in_flight_update` tool, reset at each `invokeAgentLoop` (User turn). */
   progressUpdateQuotaRef?: InFlightUpdateQuotaRef;
+  messagePersistence?: MessagePersistenceConfig;
 }
 
 export interface CliTurnResult {

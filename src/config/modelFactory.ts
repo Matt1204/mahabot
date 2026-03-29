@@ -1,101 +1,207 @@
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model, OpenAICompletionsCompat, OpenAIResponsesCompat } from "@mariozechner/pi-ai";
 import { getModel } from "@mariozechner/pi-ai";
 
-import type { AppConfig, LlmProviderConfig } from "./types.js";
+import type {
+  AppConfig,
+  LlmModelConfig,
+  LlmProviderConfig,
+  ModelFactoryModelOverridesConfig,
+} from "./types.js";
+
+interface ProviderModelMatch {
+  providerConfig: LlmProviderConfig;
+  modelConfig: LlmModelConfig;
+}
+
+const DEFAULT_CUSTOM_OPENAI_MODEL_COST = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+} as const;
+
+const DEFAULT_CUSTOM_OPENAI_INPUT: Array<"text" | "image"> = ["text"];
+const DEFAULT_CUSTOM_OPENAI_CONTEXT_WINDOW = 8192;
+const DEFAULT_CUSTOM_OPENAI_MAX_TOKENS = 2048;
 
 /**
  * Resolves the LLM model from config.
  *
- * Priority:
- * 1. If llmProvider and model are provided, try to find matching config
- * 2. Fallback to defaultProvider and defaultModel from config
- *
- * For built-in providers (openai, anthropic, etc.), uses pi-ai's getModel().
- * For custom-openai-compatible (e.g. Microsoft Foundry, Azure OpenAI), creates
- * a custom Model with baseUrl and deployment name.
+ * Fallback order:
+ * 1) requested provider/model (or requested partial + active fallback for missing side)
+ * 2) activeProvider/activeModel
+ * 3) defaultProvider/defaultModel
  */
 export function createModelFromConfig(
   config: AppConfig,
   llmProvider?: string,
   model?: string
 ): Model<any> {
-  const { defaultProvider, defaultModel, llmProviders } = config.agent;
+  const { providerConfig, modelConfig } = resolveTargetProviderModel(config, llmProvider, model);
+  const modelId = modelConfig.name;
+  const overrides = modelConfig.params?.model;
 
-  // Determine target provider and model (use params if provided, fallback to defaults)
-  const targetProvider = llmProvider || defaultProvider;
-  const targetModel = model || defaultModel;
-
-  // Try to find provider config for the target
-  let providerConfig = llmProviders.find(
-    (p) => p.provider === targetProvider && p.models.includes(targetModel) && p.enabled
-  );
-
-  // If not found with provided params, fallback to defaults
-  if (!providerConfig && (llmProvider || model)) {
-    providerConfig = llmProviders.find(
-      (p) => p.provider === defaultProvider && p.models.includes(defaultModel) && p.enabled
-    );
-  }
-
-  if (!providerConfig) {
-    // Determine which provider/model was actually attempted in the final fallback
-    const isFallbackAttempt = llmProvider || model;
-    const attemptedProvider = isFallbackAttempt ? defaultProvider : targetProvider;
-    const attemptedModel = isFallbackAttempt ? defaultModel : targetModel;
-    throw new Error(
-      `No enabled provider config for '${attemptedProvider}' + model '${attemptedModel}'. Check config.json agent.llmProviders.`
-    );
-  }
-  const modelId = providerConfig.provider === targetProvider ? targetModel : defaultModel;
-  
-  // For OpenAI-compatible custom providers (Microsoft Foundry, Azure OpenAI, etc.)，These require baseUrl for custom endpoints
+  // OpenAI-compatible custom providers (Foundry/Azure/LiteLLM/etc.) use provider-level baseUrl.
   if (providerConfig.category === "openai" && providerConfig.baseUrl) {
-    const baseUrl = providerConfig.baseUrl;
     return createCustomOpenAIModel({
       id: modelId,
       name: `${modelId} (Custom)`,
-      baseUrl: baseUrl.replace(/\/$/, ""), // normalize: remove trailing slash
+      baseUrl: providerConfig.baseUrl,
       provider: providerConfig.provider,
+      overrides,
     });
   }
 
-  // Built-in providers: openai, anthropic, google, openrouter, etc.
-  return getModel(providerConfig.provider as any, modelId as any);
+  const baseModel = getModel(providerConfig.provider as any, modelId as any);
+  return applySlimModelOverrides(baseModel, overrides);
 }
 
 /**
- * Creates a custom Model for OpenAI-compatible endpoints (Azure OpenAI,
- * Microsoft Foundry, LiteLLM, Ollama, etc.).
+ * Creates a custom model for OpenAI-compatible endpoints.
  *
- * The `id` is the deployment/model name sent to the API (e.g. "Kimi-K2.5").
+ * Metadata fields (cost/contextWindow/maxTokens) are intentionally internal defaults,
+ * not config-exposed.
  */
 export function createCustomOpenAIModel(options: {
   id: string;
   name: string;
   baseUrl: string;
   provider: string;
-  contextWindow?: number;
-  maxTokens?: number;
+  overrides?: ModelFactoryModelOverridesConfig;
 }): Model<"openai-completions"> {
-  const {
-    id,
-    name,
-    baseUrl,
-    provider,
-    contextWindow = 128000,
-    maxTokens = 32000,
-  } = options;
+  const { id, name, baseUrl, provider, overrides } = options;
 
   return {
     id,
     name,
     api: "openai-completions",
     provider,
-    baseUrl,
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow,
-    maxTokens,
+    baseUrl: normalizeBaseUrl(baseUrl),
+    reasoning: overrides?.reasoning ?? false,
+    input: overrides?.input ?? DEFAULT_CUSTOM_OPENAI_INPUT,
+    cost: {
+      ...DEFAULT_CUSTOM_OPENAI_MODEL_COST,
+    },
+    contextWindow: DEFAULT_CUSTOM_OPENAI_CONTEXT_WINDOW,
+    maxTokens: DEFAULT_CUSTOM_OPENAI_MAX_TOKENS,
+    headers: overrides?.headers,
+    compat: overrides?.compat as any,
   };
 }
+
+function resolveTargetProviderModel(
+  config: AppConfig,
+  requestedProvider?: string,
+  requestedModel?: string
+): ProviderModelMatch {
+  const { llmProviders, activeProvider, activeModel, defaultProvider, defaultModel } = config.agent;
+
+  const requestedPair = {
+    provider: requestedProvider ?? activeProvider,
+    model: requestedModel ?? activeModel,
+  };
+  const activePair = { provider: activeProvider, model: activeModel };
+  const defaultPair = { provider: defaultProvider, model: defaultModel };
+
+  const orderedCandidates = dedupeProviderModelPairs([requestedPair, activePair, defaultPair]);
+  for (const candidate of orderedCandidates) {
+    const match = findProviderModelMatch(llmProviders, candidate.provider, candidate.model);
+    if (match) {
+      return match;
+    }
+  }
+
+  const attempted = orderedCandidates
+    .map((candidate) => `'${candidate.provider}' + model '${candidate.model}'`)
+    .join(" -> ");
+  throw new Error(
+    `No enabled provider config for ${attempted}. Check config.json agent.llmProviders.`
+  );
+}
+
+function dedupeProviderModelPairs(
+  pairs: Array<{ provider: string; model: string }>
+): Array<{ provider: string; model: string }> {
+  const seen = new Set<string>();
+  const unique: Array<{ provider: string; model: string }> = [];
+
+  for (const pair of pairs) {
+    const key = `${pair.provider}\u0000${pair.model}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(pair);
+  }
+
+  return unique;
+}
+
+function applySlimModelOverrides<TApi extends string>(
+  model: Model<TApi>,
+  overrides?: ModelFactoryModelOverridesConfig
+): Model<TApi> {
+  if (!overrides) {
+    return model;
+  }
+
+  const next: Model<TApi> = {
+    ...model,
+    reasoning: overrides.reasoning ?? model.reasoning,
+    input: overrides.input ?? model.input,
+    headers:
+      overrides.headers !== undefined
+        ? mergeStringRecord(model.headers, overrides.headers)
+        : model.headers,
+  };
+
+  if (overrides.compat !== undefined) {
+    (next as any).compat = mergeCompat((model as any).compat, overrides.compat);
+  }
+
+  return next;
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/$/, "");
+}
+
+function mergeStringRecord(
+  base?: Record<string, string>,
+  override?: Record<string, string>
+): Record<string, string> | undefined {
+  if (!base && !override) {
+    return undefined;
+  }
+  return { ...(base ?? {}), ...(override ?? {}) };
+}
+
+function mergeCompat(
+  base?: OpenAICompletionsCompat | OpenAIResponsesCompat | Record<string, unknown>,
+  override?: OpenAICompletionsCompat | OpenAIResponsesCompat | Record<string, unknown>
+): OpenAICompletionsCompat | OpenAIResponsesCompat | Record<string, unknown> | undefined {
+  if (!base && !override) {
+    return undefined;
+  }
+  return { ...(base ?? {}), ...(override ?? {}) };
+}
+
+function findProviderModelMatch(
+  llmProviders: LlmProviderConfig[],
+  providerName: string,
+  modelName: string
+): ProviderModelMatch | undefined {
+  for (const providerConfig of llmProviders) {
+    if (!providerConfig.enabled || providerConfig.provider !== providerName) {
+      continue;
+    }
+
+    const modelConfig = providerConfig.models.find((candidate) => candidate.name === modelName);
+    if (modelConfig) {
+      return { providerConfig, modelConfig };
+    }
+  }
+
+  return undefined;
+}
+

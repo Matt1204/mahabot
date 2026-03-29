@@ -1,3 +1,6 @@
+import type { OpenAICompletionsCompat, OpenAIResponsesCompat } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+
 export type IngressProvider = "telegram";
 
 export interface TelegramIngressConfig {
@@ -12,7 +15,7 @@ export interface IngressConfig {
 
 export interface LlmProviderConfig {
   provider: string;
-  models: string[];
+  models: LlmModelConfig[];
   enabled: boolean;
   apiKeyEnvVar?: string;
   baseUrl?: string;
@@ -20,14 +23,35 @@ export interface LlmProviderConfig {
   category?: "openai" | "anthropic" | "google" | "openrouter";
 }
 
+export interface LlmModelConfig {
+  name: string;
+  params?: ModelFactoryDefaultsConfig;
+}
+
+export interface ModelFactoryModelOverridesConfig {
+  reasoning?: boolean;
+  input?: Array<"text" | "image">;
+  headers?: Record<string, string>;
+  compat?: OpenAICompletionsCompat | OpenAIResponsesCompat | Record<string, unknown>;
+}
+
+export interface ModelFactoryDefaultsConfig {
+  model?: ModelFactoryModelOverridesConfig;
+}
+
 export interface AgentConfig {
+  activeProvider: string;
+  activeModel: string;
   defaultProvider: string;
   defaultModel: string;
   systemPromptFile: string;
   workspaceRoot: string;
   memoryWindow: number;
+  startupRestoreMessageCount: number;
+  compactHighWatermarkTokens: number;
+  compactLowWatermarkTokens: number;
   maxTokens: number;
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel: ThinkingLevel;
   llmProviders: LlmProviderConfig[];
 }
 
@@ -39,9 +63,15 @@ export interface McpServerConfig {
   enabled: boolean;
 }
 
+export interface WebSearchConfig {
+  tavilyApiKeyEnvVar: string;
+  linkupApiKeyEnvVar: string;
+}
+
 export interface ToolsConfig {
   restrictToWorkspace: boolean;
   mcpServers: McpServerConfig[];
+  webSearch: WebSearchConfig;
 }
 
 export interface EventInspectionIncludeConfig {
@@ -81,17 +111,22 @@ export const DEFAULT_CONFIG: AppConfig = {
     },
   },
   agent: {
+    activeProvider: "openai",
+    activeModel: "gpt-4o-mini",
     defaultProvider: "openai",
     defaultModel: "gpt-4o-mini",
     systemPromptFile: "AGENTS.md",
     workspaceRoot: ".",
     memoryWindow: 50,
+    startupRestoreMessageCount: 50,
+    compactHighWatermarkTokens: 100000,
+    compactLowWatermarkTokens: 40000,
     maxTokens: 4096,
     thinkingLevel: "off",
     llmProviders: [
       {
         provider: "openai",
-        models: ["gpt-4o-mini"],
+        models: [{ name: "gpt-4o-mini" }],
         enabled: true,
         apiKeyEnvVar: "OPENAI_API_KEY",
       },
@@ -100,6 +135,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   tools: {
     restrictToWorkspace: true,
     mcpServers: [],
+    webSearch: {
+      tavilyApiKeyEnvVar: "TAVILY_API_KEY",
+      linkupApiKeyEnvVar: "LINKUP_API_KEY",
+    },
   },
   eventInspection: {
     useEventInspection: false,

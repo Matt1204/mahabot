@@ -3,7 +3,13 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { AppConfig, EventInspectionIncludeConfig, LlmProviderConfig } from "./types.js";
+import type {
+  AppConfig,
+  EventInspectionIncludeConfig,
+  LlmModelConfig,
+  LlmProviderConfig,
+  ModelFactoryModelOverridesConfig,
+} from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 
@@ -53,11 +59,13 @@ export class ConfigManager {
     const sessionRoot = resolve(homedir(), ".mahabot", sanitizedSessionId);
     const workspaceRoot = resolve(sessionRoot, "workspace");
     const persistenceRoot = resolve(workspaceRoot, "persistence");
+    const skillsRoot = resolve(workspaceRoot, "skills");
     const configPath = resolve(sessionRoot, "config.json");
 
     await ensureDir(sessionRoot);
     await ensureDir(workspaceRoot);
     await ensureDir(persistenceRoot);
+    await ensureDir(skillsRoot);
 
     const configTemplatePath = await this.getTemplatePath("config.json");
     const agentsTemplatePath = await this.getTemplatePath("AGENTS.md");
@@ -216,6 +224,13 @@ export class ConfigManager {
     return this.config.agent?.thinkingLevel ?? "off";
   }
 
+  getActiveProviderModel(): { provider: string; model: string } {
+    return {
+      provider: this.config.agent.activeProvider,
+      model: this.config.agent.activeModel,
+    };
+  }
+
   /**
    * Validates that API key exists for the given provider without exposing the key to memory.
    * Throws if the credential is missing.
@@ -266,24 +281,103 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: agent.llmProviders must contain at least one provider.");
   }
 
-  // Normalize llmProviders: migrate legacy "model" (string) to "models" (string[]).
+  // Normalize llmProviders with strict schema (no legacy compatibility):
+  // - each provider must use models: LlmModelConfig[]
+  // - reject legacy provider.model and provider.modelFactoryDefaults
   merged.agent.llmProviders = merged.agent.llmProviders.map((entry) => {
-    const e = entry as LlmProviderConfig & { model?: string };
-    if (Array.isArray(e.models)) {
-      return entry;
+    const e = entry as LlmProviderConfig & {
+      model?: unknown;
+      models?: unknown;
+      modelFactoryDefaults?: unknown;
+    };
+
+    if (e.model !== undefined) {
+      throw new Error(
+        "Invalid config: provider-level 'model' is no longer supported. Use agent.llmProviders[].models[].name."
+      );
     }
-    if (typeof e.model === "string") {
-      const { model, ...rest } = e;
-      return { ...rest, models: [model] } as LlmProviderConfig;
+
+    if (e.modelFactoryDefaults !== undefined) {
+      throw new Error(
+        "Invalid config: provider-level 'modelFactoryDefaults' is no longer supported. Use agent.llmProviders[].models[].params."
+      );
     }
-    throw new Error(
-      "Invalid config: each agent.llmProviders entry must have 'models' (string[]) or legacy 'model' (string)."
-    );
+
+    if (!Array.isArray(e.models)) {
+      throw new Error(
+        "Invalid config: each agent.llmProviders entry must provide 'models' as an array of model objects."
+      );
+    }
+
+    const normalizedModels = e.models.map((value, index) => normalizeProviderModelConfig(value, index));
+
+    if (normalizedModels.length === 0) {
+      throw new Error("Invalid config: each agent.llmProviders entry must define at least one model.");
+    }
+
+    const { models, ...rest } = e;
+    return {
+      ...rest,
+      models: normalizedModels,
+    } as LlmProviderConfig;
   });
+
+  if (typeof merged.agent.activeProvider !== "string" || merged.agent.activeProvider.trim().length === 0) {
+    throw new Error("Invalid config: agent.activeProvider must be a non-empty string.");
+  }
+  if (typeof merged.agent.activeModel !== "string" || merged.agent.activeModel.trim().length === 0) {
+    throw new Error("Invalid config: agent.activeModel must be a non-empty string.");
+  }
+  if (typeof merged.agent.defaultProvider !== "string" || merged.agent.defaultProvider.trim().length === 0) {
+    throw new Error("Invalid config: agent.defaultProvider must be a non-empty string.");
+  }
+  if (typeof merged.agent.defaultModel !== "string" || merged.agent.defaultModel.trim().length === 0) {
+    throw new Error("Invalid config: agent.defaultModel must be a non-empty string.");
+  }
+
+  validateProviderModelPairExists(
+    merged.agent.llmProviders,
+    merged.agent.activeProvider,
+    merged.agent.activeModel,
+    "active"
+  );
+  validateProviderModelPairExists(
+    merged.agent.llmProviders,
+    merged.agent.defaultProvider,
+    merged.agent.defaultModel,
+    "default"
+  );
 
   // Keep runtime behavior safe/predictable with sane numeric constraints.
   if (typeof merged.agent.memoryWindow !== "number" || merged.agent.memoryWindow < 1) {
     throw new Error("Invalid config: agent.memoryWindow must be >= 1.");
+  }
+
+  if (
+    typeof merged.agent.startupRestoreMessageCount !== "number" ||
+    merged.agent.startupRestoreMessageCount < 1
+  ) {
+    throw new Error("Invalid config: agent.startupRestoreMessageCount must be >= 1.");
+  }
+
+  if (
+    typeof merged.agent.compactHighWatermarkTokens !== "number" ||
+    merged.agent.compactHighWatermarkTokens < 1
+  ) {
+    throw new Error("Invalid config: agent.compactHighWatermarkTokens must be >= 1.");
+  }
+
+  if (
+    typeof merged.agent.compactLowWatermarkTokens !== "number" ||
+    merged.agent.compactLowWatermarkTokens < 1
+  ) {
+    throw new Error("Invalid config: agent.compactLowWatermarkTokens must be >= 1.");
+  }
+
+  if (merged.agent.compactLowWatermarkTokens >= merged.agent.compactHighWatermarkTokens) {
+    throw new Error(
+      "Invalid config: agent.compactLowWatermarkTokens must be < agent.compactHighWatermarkTokens."
+    );
   }
 
   if (typeof merged.agent.maxTokens !== "number" || merged.agent.maxTokens < 1) {
@@ -298,9 +392,214 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: tools.workspaceRoot is no longer supported. Use agent.workspaceRoot.");
   }
 
+  if (!isRecord(merged.tools.webSearch)) {
+    throw new Error("Invalid config: tools.webSearch must be an object.");
+  }
+
+  if (
+    typeof merged.tools.webSearch.tavilyApiKeyEnvVar !== "string" ||
+    merged.tools.webSearch.tavilyApiKeyEnvVar.trim().length === 0
+  ) {
+    throw new Error("Invalid config: tools.webSearch.tavilyApiKeyEnvVar must be a non-empty string.");
+  }
+
+  if (
+    typeof merged.tools.webSearch.linkupApiKeyEnvVar !== "string" ||
+    merged.tools.webSearch.linkupApiKeyEnvVar.trim().length === 0
+  ) {
+    throw new Error("Invalid config: tools.webSearch.linkupApiKeyEnvVar must be a non-empty string.");
+  }
+
   validateEventInspectionConfig(merged.eventInspection);
 
   return merged;
+}
+
+function normalizeProviderModelConfig(
+  value: unknown,
+  index: number
+): LlmModelConfig {
+  if (typeof value === "string") {
+    throw new Error(
+      `Invalid config: agent.llmProviders[].models[${index}] must be an object like { name, params? }, not a string.`
+    );
+  }
+
+  if (!isRecord(value)) {
+    throw new Error(
+      `Invalid config: agent.llmProviders[].models[${index}] must be an object with at least { name }.`
+    );
+  }
+
+  if (value.model !== undefined) {
+    throw new Error(
+      `Invalid config: agent.llmProviders[].models[${index}].model is no longer supported. Use 'name'.`
+    );
+  }
+
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  if (!name) {
+    throw new Error(`Invalid config: agent.llmProviders[].models[${index}].name must be a non-empty string.`);
+  }
+
+  if (value.params !== undefined && !isRecord(value.params)) {
+    throw new Error(
+      `Invalid config: agent.llmProviders[].models[${index}].params must be an object when provided.`
+    );
+  }
+
+  const rawParams = value.params as Record<string, unknown> | undefined;
+  if (!rawParams) {
+    return { name };
+  }
+
+  validateAllowedModelParams(rawParams, `agent.llmProviders[].models[${index}].params`);
+
+  const rawModel = rawParams.model;
+  if (rawModel === undefined) {
+    return { name };
+  }
+
+  if (!isRecord(rawModel)) {
+    throw new Error(
+      `Invalid config: agent.llmProviders[].models[${index}].params.model must be an object when provided.`
+    );
+  }
+
+  const overrides = normalizeModelOverrides(
+    rawModel,
+    `agent.llmProviders[].models[${index}].params.model`
+  );
+
+  return {
+    name,
+    params: {
+      model: overrides,
+    },
+  };
+}
+
+function validateAllowedModelParams(
+  params: Record<string, unknown>,
+  path: string
+): void {
+  if (params.agent !== undefined) {
+    throw new Error(
+      `Invalid config: ${path}.agent is removed. Use top-level agent.thinkingLevel instead.`
+    );
+  }
+  if (params.stream !== undefined) {
+    throw new Error(
+      `Invalid config: ${path}.stream is removed. Stream-level per-model config is no longer supported.`
+    );
+  }
+
+  for (const key of Object.keys(params)) {
+    if (key !== "model") {
+      throw new Error(
+        `Invalid config: ${path}.${key} is not supported. Allowed keys: model.`
+      );
+    }
+  }
+}
+
+function normalizeModelOverrides(
+  value: Record<string, unknown>,
+  path: string
+): ModelFactoryModelOverridesConfig {
+  const removedModelKeys = new Set([
+    "api",
+    "name",
+    "cost",
+    "contextWindow",
+    "maxTokens",
+    "baseUrl",
+  ]);
+  const allowedModelKeys = new Set(["reasoning", "input", "headers", "compat"]);
+
+  for (const key of Object.keys(value)) {
+    if (removedModelKeys.has(key)) {
+      throw new Error(
+        `Invalid config: ${path}.${key} is removed and now uses runtime defaults.`
+      );
+    }
+    if (!allowedModelKeys.has(key)) {
+      throw new Error(
+        `Invalid config: ${path}.${key} is not supported. Allowed keys: reasoning, input, headers, compat.`
+      );
+    }
+  }
+
+  const overrides: ModelFactoryModelOverridesConfig = {};
+
+  if (value.reasoning !== undefined) {
+    if (typeof value.reasoning !== "boolean") {
+      throw new Error(`Invalid config: ${path}.reasoning must be a boolean.`);
+    }
+    overrides.reasoning = value.reasoning;
+  }
+
+  if (value.input !== undefined) {
+    if (!Array.isArray(value.input)) {
+      throw new Error(`Invalid config: ${path}.input must be an array.`);
+    }
+    const normalizedInput = value.input.map((entry) => {
+      if (entry !== "text" && entry !== "image") {
+        throw new Error(`Invalid config: ${path}.input only supports "text" or "image".`);
+      }
+      return entry;
+    });
+    overrides.input = normalizedInput;
+  }
+
+  if (value.headers !== undefined) {
+    overrides.headers = normalizeStringRecord(value.headers, `${path}.headers`);
+  }
+
+  if (value.compat !== undefined) {
+    if (!isRecord(value.compat)) {
+      throw new Error(`Invalid config: ${path}.compat must be an object when provided.`);
+    }
+    overrides.compat = value.compat;
+  }
+
+  return overrides;
+}
+
+function normalizeStringRecord(value: unknown, path: string): Record<string, string> {
+  if (!isRecord(value)) {
+    throw new Error(`Invalid config: ${path} must be an object.`);
+  }
+
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== "string") {
+      throw new Error(`Invalid config: ${path}.${key} must be a string.`);
+    }
+    result[key] = entry;
+  }
+
+  return result;
+}
+
+function validateProviderModelPairExists(
+  llmProviders: LlmProviderConfig[],
+  provider: string,
+  model: string,
+  label: "active" | "default"
+): void {
+  const providerConfig = llmProviders.find((entry) => entry.provider === provider && entry.enabled);
+  if (!providerConfig) {
+    throw new Error(
+      `Invalid config: agent.${label}Provider '${provider}' is not found in enabled agent.llmProviders.`
+    );
+  }
+
+  if (!providerConfig.models.some((entry) => entry.name === model)) {
+    throw new Error(
+      `Invalid config: agent.${label}Model '${model}' is not found in provider '${provider}' models.`
+    );
+  }
 }
 
 function validateEventInspectionConfig(
@@ -343,9 +642,8 @@ function validateEventInspectionConfig(
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  // In JS, arrays/functions are also "object"-ish in some checks;
-  // this helper intentionally allows any non-null object-like value.
-  return typeof value === "object" && value !== null;
+  // Only treat plain object-like values as records; arrays are intentionally excluded.
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function deepMerge<T>(base: T, patch: DeepPartial<T>): T {

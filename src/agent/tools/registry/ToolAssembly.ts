@@ -1,4 +1,5 @@
 import type { AppConfig } from "../../../config/types.js";
+import { resolve } from "node:path";
 import type { InFlightUpdateQuotaRef, ProgressUpdateSink } from "../../progress/types.js";
 import { createBashTool } from "../bashTool.js";
 import { createInFlightUpdateTool } from "../inFlightUpdateTool.js";
@@ -7,6 +8,7 @@ import { createGrepTool } from "../grepTool.js";
 import { createGlobTool } from "../globTool.js";
 import { createListTreeTool } from "../listTreeTool.js";
 import { createReadFileTool } from "../readFileTool.js";
+import { createWebSearchTool } from "../webSearchTool.js";
 import { createWriteFileTool } from "../writeFileTool.js";
 import { createEchoStructuredInputTool } from "../showcase/echoStructuredInputTool.js";
 import { createFailIntentionallyTool } from "../showcase/failIntentionallyTool.js";
@@ -45,12 +47,22 @@ export function registerTools(
   registerAddonTools(toolRegistry, appConfig, toolRuntimeContext);
 }
 
+function resolveBuiltinSkillsRoot(): string {
+  return resolve(process.cwd(), "src", "agent", "skills");
+}
+
 function registerStandardTools(
   registry: ToolRegistry,
   appConfig: AppConfig,
   toolRuntimeContext: ToolRuntimeContext
 ): void {
   registry.registerStandard(createShowRuntimeInfoTool());
+  registry.registerStandard(
+    createWebSearchTool({
+      tavilyApiKeyEnvVar: appConfig.tools.webSearch.tavilyApiKeyEnvVar,
+      linkupApiKeyEnvVar: appConfig.tools.webSearch.linkupApiKeyEnvVar,
+    })
+  );
   if (toolRuntimeContext.progressUpdate) {
     registry.registerStandard(
       createInFlightUpdateTool({
@@ -62,6 +74,7 @@ function registerStandardTools(
   // Bash needs an explicit workspace root to enforce path-boundary checks.
   // In fallback construction paths without this context, we intentionally skip Bash.
   if (toolRuntimeContext.workspaceRoot) {
+    const builtinSkillsRoot = resolveBuiltinSkillsRoot();
     registry.registerStandard(
       createBashTool({
         workspaceRoot: toolRuntimeContext.workspaceRoot,
@@ -72,6 +85,7 @@ function registerStandardTools(
       createReadFileTool({
         workspaceRoot: toolRuntimeContext.workspaceRoot,
         restrictToWorkspace: appConfig.tools.restrictToWorkspace,
+        builtinSkillsRoot,
       })
     );
     registry.registerStandard(

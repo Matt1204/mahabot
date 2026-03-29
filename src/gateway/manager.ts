@@ -1,4 +1,5 @@
 import { stdin as input, stdout as output } from "node:process";
+import { resolve } from "node:path";
 import readline from "node:readline/promises";
 
 import { Agent, EventInspection } from "../agent/index.js";
@@ -9,8 +10,6 @@ import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
 
 const DEMO_SESSION_ID = "cli-stable-session";
-const DEMO_PROVIDER_NAME = "microsoft-foundry";
-const DEMO_MODEL_NAME = "gpt-5-mini";
 /**
  * Future gateway/external manager entrypoint.
  *
@@ -58,6 +57,7 @@ export class MahabotGatewayManager {
       bootstrap.workspaceRoot,
       bootstrap.persistenceRoot
     );
+    // await this.printAgentStatusOverview(agent);
 
     const rl = readline.createInterface({
       input: this.io.input,
@@ -69,31 +69,32 @@ export class MahabotGatewayManager {
 
     try {
       while (true) {
-        const line = (await rl.question("you> ")).trim();
+        const userLine = (await rl.question("you> ")).trim();
 
-        if (!line) {
+        if (!userLine) {
           continue;
         }
 
-        if (isExitCommand(line)) {
+        if (isExitCommand(userLine)) {
           this.io.output.write("Bye.\n");
           break;
         }
 
-        if (line === "/help") {
+        if (userLine === "/help") {
           this.io.output.write(helpText());
           continue;
         }
 
-        if (line === "/clear") {
+        if (userLine === "/clear") {
           try {
-            await agent.waitForIdle();
+            await agent.stop();
             agent = await this.buildAgentForSession(
               bootstrap.workspaceSessionId,
               bootstrap.sessionRoot,
               bootstrap.workspaceRoot,
               bootstrap.persistenceRoot
             );
+            // await this.printAgentStatusOverview(agent);
             this.io.output.write("Conversation context cleared and system prompt reloaded.\n\n");
           } catch (error) {
             this.io.output.write(`bot> [error] ${String(error)}\n\n`);
@@ -102,7 +103,7 @@ export class MahabotGatewayManager {
         }
 
         try {
-          const result = await agent.runCliTurn(line);
+          const result = await agent.runCliTurn(userLine);
           this.io.output.write(`bot> ${result.cliMessage}\n\n`);
         } catch (error) {
           this.io.output.write(`bot> [error] ${String(error)}\n\n`);
@@ -110,7 +111,7 @@ export class MahabotGatewayManager {
       }
     } finally {
       rl.close();
-      await agent.waitForIdle();
+      await agent.stop();
     }
   }
 
@@ -121,6 +122,7 @@ export class MahabotGatewayManager {
     persistenceRoot: string
   ): Promise<Agent> {
     const appConfig = this.configManager.get();
+    const { provider: activeProvider, model: activeModel } = this.configManager.getActiveProviderModel();
 
     // Progress path (docs/progress_sink_and_inspection_sink.md): `in_flight_update` is wired here only.
     // - `quotaRef` is shared with Agent (passed below) so Agent.invokeAgentLoop can reset `used` each turn;
@@ -147,7 +149,7 @@ export class MahabotGatewayManager {
     );
 
     // Inspection path: subscribe to runtime AgentEvent stream via `onAgentEvent` (see Agent constructor).
-    // EventInspection filters by appConfig.eventInspection, renders `[inspection]` lines, and calls
+    // EventInspection filters by appConfig.eventInspection, renders `[event_name]` lines, and calls
     // InspectionSink.publish — see eventInspection.ts for microtask deferral.
     const eventInspection = new EventInspection(appConfig.eventInspection, {
       sinks: [
@@ -156,6 +158,10 @@ export class MahabotGatewayManager {
           sink: createCliInspectionSink(this.io.output),
         },
       ],
+      getContextWatermarks: () => ({
+        lowWaterMark: appConfig.agent.compactLowWatermarkTokens,
+        highWaterMark: appConfig.agent.compactHighWatermarkTokens,
+      }),
       supportsAnsi: (channel) =>
         channel === "cli" ? supportsAnsi(this.io.output) : false,
       logger: {
@@ -168,8 +174,8 @@ export class MahabotGatewayManager {
     return Agent.createFromAppConfig(
       {
         appConfig,
-        providerName: DEMO_PROVIDER_NAME,
-        modelName: DEMO_MODEL_NAME,
+        providerName: activeProvider,
+        modelName: activeModel,
         systemPrompt: systemPromptAssembly.systemPrompt,
         thinkingLevel: this.configManager.getThinkingLevel(),
         toolRegistry,
@@ -195,9 +201,45 @@ export class MahabotGatewayManager {
           eventInspection.handleAgentEvent(event);
         },
         progressUpdateQuotaRef,
+        messagePersistence: {
+          enabled: true,
+          sessionId,
+          sessionJsonlPath: resolve(persistenceRoot, "session.jsonl"),
+          startupRestoreMessageCount: appConfig.agent.startupRestoreMessageCount,
+          compactHighWatermarkTokens: appConfig.agent.compactHighWatermarkTokens,
+          compactLowWatermarkTokens: appConfig.agent.compactLowWatermarkTokens,
+        },
       }
     );
   }
+
+  // private async printAgentStatusOverview(agent: Agent): Promise<void> {
+  //   const overview = await agent.getStartupStatusOverview();
+  //   const historyRoleSummary = `user=${overview.history.loadedByRole.user}, assistant=${overview.history.loadedByRole.assistant}, toolResult=${overview.history.loadedByRole.toolResult}, other=${overview.history.loadedByRole.other}`;
+  //   const thinkingBudgets = overview.agent.thinkingBudgets
+  //     ? JSON.stringify(overview.agent.thinkingBudgets)
+  //     : "(none)";
+  //   const sessionId = overview.agent.sessionId ?? "(none)";
+  //   const maxRetryDelayMs =
+  //     overview.agent.maxRetryDelayMs === undefined ? "(default)" : String(overview.agent.maxRetryDelayMs);
+  //   const historyError = overview.history.error ? ` error=${overview.history.error}` : "";
+
+  //   this.io.output.write(
+  //     [
+  //       "[agent status overview]",
+  //       `model provider=${overview.model.provider} id=${overview.model.id} name=${overview.model.name} api=${overview.model.api}`,
+  //       `model baseUrl=${overview.model.baseUrl}`,
+  //       `model reasoning=${overview.model.reasoning} input=${overview.model.input.join(",")} contextWindow=${overview.model.contextWindow} maxTokens=${overview.model.maxTokens}`,
+  //       `model cost input=${overview.model.cost.input} output=${overview.model.cost.output} cacheRead=${overview.model.cost.cacheRead} cacheWrite=${overview.model.cost.cacheWrite}`,
+  //       `model headersConfigured=${overview.model.headersConfigured} compatConfigured=${overview.model.compatConfigured}`,
+  //       `agent thinkingLevel=${overview.agent.thinkingLevel} transport=${overview.agent.transport} sessionId=${sessionId} maxRetryDelayMs=${maxRetryDelayMs}`,
+  //       `agent thinkingBudgets=${thinkingBudgets} tools=${overview.agent.tools} runtimeMessages=${overview.agent.runtimeMessages} isStreaming=${overview.agent.isStreaming} pendingToolCalls=${overview.agent.pendingToolCalls}`,
+  //       `history restoreStatus=${overview.history.restoreStatus} loadedMessages=${overview.history.loadedMessages} persistedCursor=${overview.history.persistedCursor} runtimeMessages=${overview.history.runtimeMessages}`,
+  //       `history loadedByRole ${historyRoleSummary}${historyError}`,
+  //       "",
+  //     ].join("\n")
+  //   );
+  // }
 }
 
 // Minimal InspectionSink for CLI: one rendered line per publish (prefix already in `event.line`).

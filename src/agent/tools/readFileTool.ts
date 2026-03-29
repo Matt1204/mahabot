@@ -15,6 +15,7 @@ const DEFAULT_MAX_BYTES = 8 * 1024;
 interface CreateReadFileToolInput {
   workspaceRoot: string;
   restrictToWorkspace: boolean;
+  builtinSkillsRoot: string;
 }
 
 interface ReadFileDetails extends FsToolBaseDetails {
@@ -53,6 +54,7 @@ export function createReadFileTool(input: CreateReadFileToolInput): DescribedAge
     label: "Read File",
     description:
       "Use this tool when you need to inspect the contents of a text file. It reads UTF-8 text safely with optional pagination (`offset`, `maxBytes`) so large files can be read in chunks. Output includes the text plus metadata such as bytes read, total file size, truncation status, and nextOffset for follow-up reads.",
+    toolRulePrompt: buildToolRulePrompt(input.builtinSkillsRoot),
     parameters: schema,
     async execute(_toolCallId, params) {
       const offset = normalizeNonNegativeInteger(params.offset, 0);
@@ -70,7 +72,7 @@ export function createReadFileTool(input: CreateReadFileToolInput): DescribedAge
         return fail("Invalid `maxBytes`: expected an integer in [256, 65536].", {
           tool: "read_file",
           ok: false,
-          errorCode: "invalid_offset",
+          errorCode: "invalid_max_bytes",
         });
       }
 
@@ -79,6 +81,7 @@ export function createReadFileTool(input: CreateReadFileToolInput): DescribedAge
           inputPath: params.path,
           workspaceRoot: input.workspaceRoot,
           restrictToWorkspace: input.restrictToWorkspace,
+          additionalAllowedRoots: [input.builtinSkillsRoot],
         });
 
         await assertFilePath(resolvedPath);
@@ -128,6 +131,16 @@ export function createReadFileTool(input: CreateReadFileToolInput): DescribedAge
   };
 
   return tool;
+}
+
+function buildToolRulePrompt(builtinSkillsRoot: string): string {
+  return [
+    "Read UTF-8 text files when you need exact file contents for analysis, extraction, or verification.",
+    "Use pagination for large files: start with default maxBytes, then continue with nextOffset until truncated=false.",
+    "In workspace-restricted mode, this tool can read workspace files and builtin skill files under:",
+    `- ${builtinSkillsRoot}`,
+    "Special skill rule: before following a skill workflow, read that skill's SKILL.md with read_file instead of assuming the skill body from metadata.",
+  ].join("\n");
 }
 
 function fail(message: string, details: ReadFileDetails) {

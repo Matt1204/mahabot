@@ -7,13 +7,12 @@ import type {
   InspectionSink,
   InspectionTokenUsage,
 } from "./contracts.js";
+import { formatToolEnd, formatToolStart, formatToolUpdate } from "./toolInspectionFormatters.js";
 
-const INSPECTION_PREFIX = "[inspection]";
-const MAX_SUMMARY_CHARS = 120;
-const MAX_PARAMS_CHARS = 180;
-const MAX_OBJECT_DEPTH = 2;
-const MAX_OBJECT_KEYS = 8;
-const MAX_ARRAY_ITEMS = 5;
+interface ContextWatermarks {
+  lowWaterMark: number;
+  highWaterMark: number;
+}
 
 export interface EventInspectionSinkBinding {
   channel: InspectionChannel;
@@ -25,6 +24,7 @@ export interface EventInspectionDeps {
   logger?: Pick<Console, "debug" | "warn" | "error">;
   now?: () => number;
   supportsAnsi?: (channel: InspectionChannel) => boolean;
+  getContextWatermarks?: () => ContextWatermarks | undefined;
 }
 
 /**
@@ -37,7 +37,7 @@ export class EventInspection {
   private readonly logger: Pick<Console, "debug" | "warn" | "error">;
   private readonly now: () => number;
   private readonly supportsAnsi: (channel: InspectionChannel) => boolean;
-  private hasEmittedUsageInCurrentTurn = false;
+  private readonly getContextWatermarks: () => ContextWatermarks | undefined;
   private lastUsageFingerprint: string | null = null;
 
   constructor(
@@ -47,6 +47,7 @@ export class EventInspection {
     this.logger = deps.logger ?? console;
     this.now = deps.now ?? (() => Date.now());
     this.supportsAnsi = deps.supportsAnsi ?? (() => false);
+    this.getContextWatermarks = deps.getContextWatermarks ?? (() => undefined);
   }
 
   handleAgentEvent(event: AgentEvent): void {
@@ -61,66 +62,60 @@ export class EventInspection {
       }
 
       const includeMainEvent = shouldInclude(event.type, this.config);
-      const canEmitTokenUsageFromStream =
-        this.config.showTokenUsage && event.type === "message_update";
-      const canEmitTokenUsageFromTurnEndFallback =
-        this.config.showTokenUsage && event.type === "turn_end" && !this.hasEmittedUsageInCurrentTurn;
-      const includeTokenUsage = canEmitTokenUsageFromStream || canEmitTokenUsageFromTurnEndFallback;
+      const includeTokenUsage = this.config.showTokenUsage && event.type === "turn_end";
 
       if (!includeMainEvent && !includeTokenUsage) {
         return;
       }
 
-      if (event.type === "turn_start") {
-        this.hasEmittedUsageInCurrentTurn = false;
-        this.lastUsageFingerprint = null;
+      const tokenUsage =
+        includeTokenUsage && event.type === "turn_end"
+          ? extractTokenUsage(event, this.getContextWatermarks())
+          : undefined;
+      const shouldEmitTokenUsage =
+        tokenUsage !== undefined && toUsageFingerprint(tokenUsage) !== this.lastUsageFingerprint;
+
+      if (shouldEmitTokenUsage && tokenUsage) {
+        this.lastUsageFingerprint = toUsageFingerprint(tokenUsage);
       }
 
       for (const target of this.deps.sinks) {
-        const renderedEvents: InspectionRenderedEvent[] = [
-          ...(includeMainEvent
-            ? [
-                {
-                  channel: target.channel,
-                  eventType: event.type,
-                  line: renderInspectionLine(
-                    summarizeEvent(event),
-                    target.channel,
-                    this.supportsAnsi(target.channel)
-                  ),
-                  timestamp: this.now(),
-                  metadata: {
-                    kind: "event",
-                  },
-                } satisfies InspectionRenderedEvent,
-              ]
-            : []),
-        ];
+        const renderedEvents: InspectionRenderedEvent[] = [];
 
-        if (includeTokenUsage && (event.type === "message_update" || event.type === "turn_end")) {
-          const tokenUsage = extractTokenUsage(event.message);
-          if (tokenUsage) {
-            const usageFingerprint = toUsageFingerprint(tokenUsage);
-            if (event.type === "message_update" && usageFingerprint === this.lastUsageFingerprint) {
-              continue;
-            }
-            this.hasEmittedUsageInCurrentTurn = true;
-            this.lastUsageFingerprint = usageFingerprint;
-            renderedEvents.push({
-              channel: target.channel,
-              eventType: event.type,
-              line: renderInspectionLine(
-                formatTokenUsageLine(tokenUsage, event.type),
-                target.channel,
-                this.supportsAnsi(target.channel)
-              ),
-              timestamp: this.now(),
-              metadata: {
-                kind: "token_usage",
-                tokenUsage,
-              },
-            });
-          }
+        if (includeMainEvent) {
+          const lineParts = summarizeEvent(event);
+          renderedEvents.push({
+            channel: target.channel,
+            eventType: event.type,
+            line: renderInspectionLine(
+              lineParts.label,
+              lineParts.content,
+              target.channel,
+              this.supportsAnsi(target.channel)
+            ),
+            timestamp: this.now(),
+            metadata: {
+              kind: "event",
+            },
+          } satisfies InspectionRenderedEvent);
+        }
+
+        if (shouldEmitTokenUsage && tokenUsage) {
+          renderedEvents.push({
+            channel: target.channel,
+            eventType: event.type,
+            line: renderInspectionLine(
+              "token_usage",
+              formatTokenUsageLine(tokenUsage),
+              target.channel,
+              this.supportsAnsi(target.channel)
+            ),
+            timestamp: this.now(),
+            metadata: {
+              kind: "token_usage",
+              tokenUsage,
+            },
+          });
         }
 
         for (const rendered of renderedEvents) {
@@ -140,75 +135,82 @@ export class EventInspection {
       this.logger.warn(`[event inspection error] ${String(error)}`);
     }
   }
-
 }
 
 function shouldInclude(eventType: AgentEvent["type"], config: EventInspectionConfig): boolean {
   return config.include[eventType] === true;
 }
 
-function renderInspectionLine(summary: string, channel: InspectionChannel, ansiEnabled: boolean): string {
-  const prefix =
-    channel === "cli" && ansiEnabled
-      ? `\u001b[36m${INSPECTION_PREFIX}\u001b[0m`
-      : INSPECTION_PREFIX;
+function renderInspectionLine(
+  eventName: string,
+  content: string,
+  channel: InspectionChannel,
+  ansiEnabled: boolean
+): string {
+  const line = `[${eventName}] ${content}`;
+  if (channel !== "cli" || !ansiEnabled) {
+    return line;
+  }
 
-  return `${prefix} ${summary}`;
+  // Keep inspection output subtle so it does not compete with user input/final answers.
+  return `\u001b[2m${line}\u001b[0m`;
 }
 
-function formatTokenUsageLine(
-  usage: InspectionTokenUsage,
-  sourceEventType: "message_update" | "turn_end"
-): string {
+function formatTokenUsageLine(usage: InspectionTokenUsage): string {
   return [
-    "token_usage",
-    `source=${sourceEventType}`,
-    `input=${usage.input}`,
-    `output=${usage.output}`,
-    `cacheRead=${usage.cacheRead}`,
-    `cacheWrite=${usage.cacheWrite}`,
-    `total=${usage.totalTokens}`,
-    `cost=$${usage.costTotal.toFixed(4)}`,
+    `curContextSize=${usage.curContextSize}`,
+    `lowWaterMark=${usage.lowWaterMark}`,
+    `highWaterMark=${usage.highWaterMark}`,
   ].join(" ");
 }
 
-function extractTokenUsage(message: unknown): InspectionTokenUsage | undefined {
-  if (!isRecord(message)) {
+function extractTokenUsage(
+  event: Extract<AgentEvent, { type: "turn_end" }>,
+  fallbackWatermarks: ContextWatermarks | undefined
+): InspectionTokenUsage | undefined {
+  const messageUsage = isRecord(event.message) && isRecord(event.message.usage) ? event.message.usage : undefined;
+  const curContextSize = messageUsage ? toNumber(messageUsage.totalTokens) : undefined;
+  if (curContextSize === undefined) {
     return undefined;
   }
 
-  const usage = message.usage;
-  if (!isRecord(usage)) {
-    return undefined;
-  }
-
-  const input = toNumber(usage.input);
-  const output = toNumber(usage.output);
-  const cacheRead = toNumber(usage.cacheRead);
-  const cacheWrite = toNumber(usage.cacheWrite);
-  const totalTokens = toNumber(usage.totalTokens);
-  const cost = isRecord(usage.cost) ? usage.cost : undefined;
-  const costTotal = cost ? toNumber(cost.total) : undefined;
-
-  if (
-    input === undefined ||
-    output === undefined ||
-    cacheRead === undefined ||
-    cacheWrite === undefined ||
-    totalTokens === undefined ||
-    costTotal === undefined
-  ) {
+  const contextBudget = extractContextBudget(event, fallbackWatermarks);
+  if (!contextBudget) {
     return undefined;
   }
 
   return {
-    input,
-    output,
-    cacheRead,
-    cacheWrite,
-    totalTokens,
-    costTotal,
+    curContextSize,
+    lowWaterMark: contextBudget.lowWaterMark,
+    highWaterMark: contextBudget.highWaterMark,
   };
+}
+
+function extractContextBudget(
+  event: AgentEvent,
+  fallbackWatermarks: ContextWatermarks | undefined
+): ContextWatermarks | undefined {
+  const eventWithContextBudget = event as AgentEvent & {
+    contextBudget?: {
+      lowWaterMark?: unknown;
+      highWaterMark?: unknown;
+    };
+  };
+
+  const lowFromEvent = toNumber(eventWithContextBudget.contextBudget?.lowWaterMark);
+  const highFromEvent = toNumber(eventWithContextBudget.contextBudget?.highWaterMark);
+  if (lowFromEvent !== undefined && highFromEvent !== undefined) {
+    return {
+      lowWaterMark: lowFromEvent,
+      highWaterMark: highFromEvent,
+    };
+  }
+
+  if (fallbackWatermarks) {
+    return fallbackWatermarks;
+  }
+
+  return undefined;
 }
 
 function toNumber(value: unknown): number | undefined {
@@ -219,151 +221,43 @@ function toNumber(value: unknown): number | undefined {
 }
 
 function toUsageFingerprint(usage: InspectionTokenUsage): string {
-  return [
-    usage.input,
-    usage.output,
-    usage.cacheRead,
-    usage.cacheWrite,
-    usage.totalTokens,
-    usage.costTotal,
-  ].join("|");
+  return [usage.curContextSize, usage.lowWaterMark, usage.highWaterMark].join("|");
 }
 
-function summarizeEvent(event: AgentEvent): string {
+function summarizeEvent(event: AgentEvent): { label: string; content: string } {
   switch (event.type) {
     case "agent_start":
-      return "agent_start";
+      return { label: event.type, content: "Agent started." };
     case "agent_end":
-      return `agent_end messages=${event.messages.length}`;
+      return { label: event.type, content: "Agent finished." };
     case "turn_start":
-      return "turn_start";
+      return { label: event.type, content: "Starting your request." };
     case "turn_end":
-      return `turn_end role=${extractRole(event.message)} toolResults=${event.toolResults.length}`;
+      return { label: event.type, content: "Turn complete." };
     case "message_start":
-      return `message_start role=${extractRole(event.message)}`;
+      return { label: event.type, content: "Assistant is preparing a response." };
     case "message_update":
-      return summarizeMessageUpdate(event);
+      return { label: event.type, content: "Assistant is writing the response." };
     case "message_end":
-      return `message_end role=${extractRole(event.message)}`;
+      return { label: event.type, content: "Assistant finished the response." };
     case "tool_execution_start":
-      return `tool_start name=${event.toolName} id=${event.toolCallId} argsKeys=[${extractArgKeys(event.args).join(", ")}] params=${shortSummary(
-        event.args,
-        MAX_PARAMS_CHARS
-      )}`;
+      return {
+        label: event.toolName,
+        content: formatToolStart(event.toolName, event.args),
+      };
     case "tool_execution_update":
-      return `tool_update name=${event.toolName} id=${event.toolCallId} summary=${shortSummary(event.partialResult)}`;
+      return {
+        label: event.toolName,
+        content: formatToolUpdate(event.toolName, event.partialResult),
+      };
     case "tool_execution_end":
-      return `tool_end name=${event.toolName} id=${event.toolCallId} status=${
-        event.isError ? "error" : "success"
-      } summary=${shortSummary(event.result)}`;
+      return {
+        label: event.toolName,
+        content: formatToolEnd(event.toolName, event.result, event.isError),
+      };
     default:
-      return `event=${String((event as { type: unknown }).type)}`;
+      return { label: "event", content: "Agent updated." };
   }
-}
-
-function summarizeMessageUpdate(event: Extract<AgentEvent, { type: "message_update" }>): string {
-  const updateType = event.assistantMessageEvent?.type ?? "unknown";
-  const delta = (event.assistantMessageEvent as { delta?: unknown }).delta;
-  if (typeof delta === "string") {
-    return `message_update stream=${updateType} deltaChars=${delta.length}`;
-  }
-
-  return `message_update stream=${updateType}`;
-}
-
-function extractRole(message: unknown): string {
-  if (isRecord(message) && typeof message.role === "string" && message.role.trim().length > 0) {
-    return message.role;
-  }
-  return "unknown";
-}
-
-function extractArgKeys(value: unknown): string[] {
-  if (!isRecord(value)) {
-    return [];
-  }
-  return Object.keys(value).sort();
-}
-
-function shortSummary(value: unknown, maxChars = MAX_SUMMARY_CHARS): string {
-  const masked = sanitizeValue(value, MAX_OBJECT_DEPTH);
-
-  let serialized = "";
-  try {
-    serialized = JSON.stringify(masked);
-  } catch {
-    serialized = String(masked);
-  }
-
-  if (!serialized || serialized === "undefined") {
-    return "\"\"";
-  }
-
-  const singleLine = serialized.replace(/\s+/g, " ").trim();
-  return truncate(singleLine, maxChars);
-}
-
-function sanitizeValue(value: unknown, depth: number): unknown {
-  if (value === null || value === undefined) {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    return truncate(value, MAX_SUMMARY_CHARS);
-  }
-
-  if (typeof value !== "object") {
-    return value;
-  }
-
-  if (depth <= 0) {
-    return "[Truncated]";
-  }
-
-  if (Array.isArray(value)) {
-    const items = value.slice(0, MAX_ARRAY_ITEMS).map((item) => sanitizeValue(item, depth - 1));
-    if (value.length > MAX_ARRAY_ITEMS) {
-      items.push(`...(${value.length - MAX_ARRAY_ITEMS} more)`);
-    }
-    return items;
-  }
-
-  if (!isRecord(value)) {
-    return "[Unserializable]";
-  }
-
-  const entries = Object.entries(value);
-  const trimmedEntries = entries.slice(0, MAX_OBJECT_KEYS);
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of trimmedEntries) {
-    output[key] = isSensitiveKey(key) ? "[REDACTED]" : sanitizeValue(child, depth - 1);
-  }
-  if (entries.length > MAX_OBJECT_KEYS) {
-    output.__truncated_keys__ = entries.length - MAX_OBJECT_KEYS;
-  }
-  return output;
-}
-
-function truncate(input: string, maxChars: number): string {
-  if (input.length <= maxChars) {
-    return input;
-  }
-  return `${input.slice(0, Math.max(0, maxChars - 3))}...`;
-}
-
-function isSensitiveKey(key: string): boolean {
-  const normalized = key.toLowerCase();
-  return (
-    normalized === "key" ||
-    normalized.includes("token") ||
-    normalized.includes("secret") ||
-    normalized.includes("password") ||
-    normalized.includes("authorization") ||
-    normalized.includes("api_key") ||
-    normalized.includes("apikey") ||
-    normalized.includes("access_key") ||
-    normalized.includes("private_key")
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

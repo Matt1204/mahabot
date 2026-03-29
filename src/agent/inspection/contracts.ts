@@ -3,12 +3,9 @@ import type { AgentEvent } from "@mariozechner/pi-agent-core";
 export type InspectionChannel = "cli" | "telegram";
 
 export interface InspectionTokenUsage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  totalTokens: number;
-  costTotal: number;
+  curContextSize: number;
+  lowWaterMark: number;
+  highWaterMark: number;
 }
 
 export interface InspectionRenderedEvent {
