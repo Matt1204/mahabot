@@ -1,7 +1,6 @@
 import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
 import type { AppConfig } from "../config/types.js";
-import type { InFlightUpdateQuotaRef } from "./progress/types.js";
 import { ToolRegistry } from "./tools/registry/toolRegistry.js";
 
 export type Channel = "cli" | "telegram" | "unknown";
@@ -74,8 +73,6 @@ export interface AgentDependencies {
   logger?: Pick<Console, "debug" | "info" | "warn" | "error">;
   now?: () => number;
   onAgentEvent?: (event: AgentEvent) => void;
-  /** When set with `in_flight_update` tool, reset at each `invokeAgentLoop` (User turn). */
-  progressUpdateQuotaRef?: InFlightUpdateQuotaRef;
   messagePersistence?: MessagePersistenceConfig;
 }
 

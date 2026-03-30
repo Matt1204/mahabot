@@ -38,7 +38,8 @@ describe("toolInspectionFormatters", () => {
     };
 
     const line = formatToolEnd("read_file", result, false);
-    assert.match(line, /^"\/tmp\/demo\.txt" "A{30}\.\.\."/);
+    const expectedPrefix = new RegExp(`^\"\\/tmp\\/demo\\.txt\" \"A{${MAX_TOOL_IO_CHARS}}\\.\\.\\.\"`);
+    assert.match(line, expectedPrefix);
     assert.match(line, /\(truncated, nextOffset=2048\)$/);
   });
 

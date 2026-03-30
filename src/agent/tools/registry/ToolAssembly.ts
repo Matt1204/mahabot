@@ -1,6 +1,6 @@
 import type { AppConfig } from "../../../config/types.js";
 import { resolve } from "node:path";
-import type { InFlightUpdateQuotaRef, ProgressUpdateSink } from "../../progress/types.js";
+import type { AgentRuntimeStatusPublisher } from "../../runtimeStatus/types.js";
 import { createBashTool } from "../bashTool.js";
 import { createInFlightUpdateTool } from "../inFlightUpdateTool.js";
 import { createEditFileTool } from "../editFileTool.js";
@@ -21,13 +21,11 @@ import type { ToolRegistry } from "./toolRegistry.js";
 export interface ToolRuntimeContext {
   workspaceRoot?: string;
   /**
-   * When set, registers `in_flight_update` with this sink and quota ref (gateway must pass the same
-   * quotaRef to Agent.createFromAppConfig deps so invokeAgentLoop resets `used` each turn).
-   * Omit in environments that should not expose user-visible progress lines.
+   * When set, registers `in_flight_update` with this status publisher.
+   * Omit in environments that should not expose runtime status lines.
    */
-  progressUpdate?: {
-    sink: ProgressUpdateSink;
-    quotaRef: InFlightUpdateQuotaRef;
+  runtimeStatus?: {
+    publish: AgentRuntimeStatusPublisher;
   };
 }
 
@@ -63,11 +61,10 @@ function registerStandardTools(
       linkupApiKeyEnvVar: appConfig.tools.webSearch.linkupApiKeyEnvVar,
     })
   );
-  if (toolRuntimeContext.progressUpdate) {
+  if (toolRuntimeContext.runtimeStatus) {
     registry.registerStandard(
       createInFlightUpdateTool({
-        sink: toolRuntimeContext.progressUpdate.sink,
-        quotaRef: toolRuntimeContext.progressUpdate.quotaRef,
+        publishStatus: toolRuntimeContext.runtimeStatus.publish,
       })
     );
   }

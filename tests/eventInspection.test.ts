@@ -3,12 +3,16 @@ import { describe, test } from "node:test";
 
 import type { EventInspectionConfig } from "../src/config/types.js";
 import { EventInspection } from "../src/agent/inspection/eventInspection.ts";
-import type { InspectionRenderedEvent } from "../src/agent/inspection/contracts.js";
+import type { AgentRuntimeStatusMessage } from "../src/agent/runtimeStatus/types.js";
 
-function createConfig(include: Partial<EventInspectionConfig["include"]>): EventInspectionConfig {
+function createConfig(
+  include: Partial<EventInspectionConfig["include"]>,
+  overrides?: Partial<Pick<EventInspectionConfig, "useEventInspection" | "showTokenUsage">>,
+  thinkingEnabled = false
+): EventInspectionConfig {
   return {
-    useEventInspection: true,
-    showTokenUsage: false,
+    useEventInspection: overrides?.useEventInspection ?? true,
+    showTokenUsage: overrides?.showTokenUsage ?? false,
     include: {
       agent_start: false,
       agent_end: false,
@@ -22,6 +26,10 @@ function createConfig(include: Partial<EventInspectionConfig["include"]>): Event
       tool_execution_end: false,
       ...include,
     },
+    thinking: {
+      enabled: thinkingEnabled,
+      emitMode: "on_end",
+    },
   };
 }
 
@@ -29,19 +37,11 @@ async function waitForInspectionFlush(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-describe("EventInspection tool labels", () => {
-  test("tool_execution_start uses [tool_name] prefix", async () => {
-    const published: InspectionRenderedEvent[] = [];
+describe("EventInspection to MessageBus runtime status", () => {
+  test("tool_execution_start publishes agent.runtime.event with [tool_name] prefix", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
     const inspection = new EventInspection(createConfig({ tool_execution_start: true }), {
-      sinks: [
-        {
-          channel: "cli",
-          sink: {
-            publish: (event) => published.push(event),
-          },
-        },
-      ],
-      supportsAnsi: () => false,
+      publishStatus: (message) => published.push(message),
     });
 
     inspection.handleAgentEvent({
@@ -54,24 +54,17 @@ describe("EventInspection tool labels", () => {
     await waitForInspectionFlush();
 
     assert.equal(published.length, 1);
+    assert.equal(published[0].kind, "agent.runtime.event");
     assert.equal(
-      published[0].line,
+      published[0].text,
       "[read_file] \"/Users/zihanma/demo.txt\""
     );
   });
 
-  test("tool_execution_update uses [tool_name] prefix", async () => {
-    const published: InspectionRenderedEvent[] = [];
+  test("tool_execution_update publishes agent.runtime.event", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
     const inspection = new EventInspection(createConfig({ tool_execution_update: true }), {
-      sinks: [
-        {
-          channel: "cli",
-          sink: {
-            publish: (event) => published.push(event),
-          },
-        },
-      ],
-      supportsAnsi: () => false,
+      publishStatus: (message) => published.push(message),
     });
 
     inspection.handleAgentEvent({
@@ -88,21 +81,14 @@ describe("EventInspection tool labels", () => {
     await waitForInspectionFlush();
 
     assert.equal(published.length, 1);
-    assert.equal(published[0].line, "[progressive_ticker] \"step 2/5\"");
+    assert.equal(published[0].kind, "agent.runtime.event");
+    assert.equal(published[0].text, "[progressive_ticker] \"step 2/5\"");
   });
 
-  test("tool_execution_end uses [tool_name] prefix and keeps stderr when stdout exists", async () => {
-    const published: InspectionRenderedEvent[] = [];
+  test("tool_execution_end publishes agent.runtime.event and keeps stderr with stdout", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
     const inspection = new EventInspection(createConfig({ tool_execution_end: true }), {
-      sinks: [
-        {
-          channel: "cli",
-          sink: {
-            publish: (event) => published.push(event),
-          },
-        },
-      ],
-      supportsAnsi: () => false,
+      publishStatus: (message) => published.push(message),
     });
 
     inspection.handleAgentEvent({
@@ -135,6 +121,129 @@ describe("EventInspection tool labels", () => {
     await waitForInspectionFlush();
 
     assert.equal(published.length, 1);
-    assert.equal(published[0].line, "[bash] \"stdout: done; stderr: warn\"");
+    assert.equal(published[0].kind, "agent.runtime.event");
+    assert.equal(published[0].text, "[bash] \"stdout: done; stderr: warn\"");
+  });
+
+  test("thinking_end publishes one complete agent.runtime.thinking line", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
+    const inspection = new EventInspection(createConfig({}, { useEventInspection: false }, true), {
+      publishStatus: (message) => published.push(message),
+    });
+
+    inspection.handleAgentEvent({ type: "turn_start" } as any);
+    inspection.handleAgentEvent({
+      type: "message_start",
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_start",
+        contentIndex: 0,
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 0,
+        delta: "draft reasoning",
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_end",
+        contentIndex: 0,
+        content: "final reasoning",
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+
+    await waitForInspectionFlush();
+
+    assert.equal(published.length, 1);
+    assert.equal(published[0].kind, "agent.runtime.thinking");
+    assert.equal(published[0].text, "[thinking] final reasoning");
+    assert.deepEqual(published[0].raw, {
+      phase: "end",
+      turnSeq: 1,
+      assistantSeq: 1,
+      contentIndex: 0,
+    });
+  });
+
+  test("thinking_end falls back to buffered delta content when event content is absent", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
+    const inspection = new EventInspection(createConfig({}, { useEventInspection: false }, true), {
+      publishStatus: (message) => published.push(message),
+    });
+
+    inspection.handleAgentEvent({ type: "turn_start" } as any);
+    inspection.handleAgentEvent({
+      type: "message_start",
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_start",
+        contentIndex: 2,
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 2,
+        delta: "assembled from",
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 2,
+        delta: " deltas",
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+    inspection.handleAgentEvent({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_end",
+        contentIndex: 2,
+      },
+      message: {
+        role: "assistant",
+      },
+    } as any);
+
+    await waitForInspectionFlush();
+
+    assert.equal(published.length, 1);
+    assert.equal(published[0].kind, "agent.runtime.thinking");
+    assert.equal(published[0].text, "[thinking] assembled from deltas");
   });
 });

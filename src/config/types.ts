@@ -87,10 +87,17 @@ export interface EventInspectionIncludeConfig {
   tool_execution_end: boolean;
 }
 
+export interface EventInspectionThinkingConfig {
+  enabled: boolean;
+  emitMode: "on_end";
+  maxChars?: number;
+}
+
 export interface EventInspectionConfig {
   useEventInspection: boolean;
   showTokenUsage: boolean;
   include: EventInspectionIncludeConfig;
+  thinking: EventInspectionThinkingConfig;
 }
 
 export interface AppConfig {
@@ -154,6 +161,10 @@ export const DEFAULT_CONFIG: AppConfig = {
       tool_execution_start: false,
       tool_execution_update: false,
       tool_execution_end: false,
+    },
+    thinking: {
+      enabled: false,
+      emitMode: "on_end",
     },
   },
 };

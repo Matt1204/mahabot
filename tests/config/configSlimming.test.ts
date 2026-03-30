@@ -111,6 +111,29 @@ describe("config slimming validation", () => {
       /params\.model\.baseUrl is removed/
     );
   });
+
+  test("rejects removed agent.runtimeStatus and validates eventInspection.thinking", () => {
+    const config = cloneConfig() as any;
+    config.agent.runtimeStatus = { emitThinking: true };
+
+    const manager = new ConfigManager();
+    assert.throws(
+      () => manager.set(config),
+      /agent\.runtimeStatus is removed/
+    );
+
+    const validConfig = cloneConfig() as any;
+    validConfig.eventInspection.thinking = {
+      enabled: true,
+      emitMode: "on_end",
+      maxChars: 120,
+    };
+
+    const normalized = manager.set(validConfig);
+    assert.equal(normalized.eventInspection.thinking.enabled, true);
+    assert.equal(normalized.eventInspection.thinking.emitMode, "on_end");
+    assert.equal(normalized.eventInspection.thinking.maxChars, 120);
+  });
 });
 
 describe("modelFactory fallback order", () => {

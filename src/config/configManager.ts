@@ -384,6 +384,12 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: agent.maxTokens must be >= 1.");
   }
 
+  if ("runtimeStatus" in (merged.agent as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "Invalid config: agent.runtimeStatus is removed. Use eventInspection.thinking.enabled instead."
+    );
+  }
+
   if (typeof merged.agent.workspaceRoot !== "string" || merged.agent.workspaceRoot.trim().length === 0) {
     throw new Error("Invalid config: agent.workspaceRoot must be a non-empty string.");
   }
@@ -638,6 +644,25 @@ function validateEventInspectionConfig(
     if (typeof value.include[key] !== "boolean") {
       throw new Error(`Invalid config: eventInspection.include.${key} must be a boolean.`);
     }
+  }
+
+  if (!isRecord(value.thinking)) {
+    throw new Error("Invalid config: eventInspection.thinking must be an object.");
+  }
+
+  if (typeof value.thinking.enabled !== "boolean") {
+    throw new Error("Invalid config: eventInspection.thinking.enabled must be a boolean.");
+  }
+
+  if (value.thinking.emitMode !== "on_end") {
+    throw new Error("Invalid config: eventInspection.thinking.emitMode must be 'on_end'.");
+  }
+
+  if (
+    value.thinking.maxChars !== undefined &&
+    (!Number.isInteger(value.thinking.maxChars) || value.thinking.maxChars < 1)
+  ) {
+    throw new Error("Invalid config: eventInspection.thinking.maxChars must be an integer >= 1 when provided.");
   }
 }
 
