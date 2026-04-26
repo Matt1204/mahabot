@@ -42,6 +42,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "onboard") {
+    const manager = new MahabotGatewayManager();
+    await manager.runTelegramOnboardingMode();
+    return;
+  }
+
   if (command === "telegram") {
     const manager = new MahabotGatewayManager();
     await manager.runInTelegramMode();
@@ -54,6 +60,7 @@ async function main(): Promise<void> {
 function printHelp(): void {
   console.log([
     "Usage:",
+    "  mahabot onboard",
     "  mahabot cli",
     "  mahabot telegram",
     "  mahabot help",
@@ -62,6 +69,7 @@ function printHelp(): void {
     "  -h, --help                    Show this help",
     "",
     "Examples:",
+    "  mahabot onboard",
     "  mahabot cli",
     "  mahabot telegram",
   ].join("\n"));

@@ -4,7 +4,7 @@
     "telegram": {
       "enabled": true,
       "botTokenEnvVar": "TELEGRAM_BOT_TOKEN",
-      "allowedChatIds": ["7346503136"],
+      "allowedChatIds": [],
       "media": {
         "pendingImageTimeoutMs": 600000,
         "ffmpegCommand": "ffmpeg",

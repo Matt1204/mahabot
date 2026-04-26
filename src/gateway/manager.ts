@@ -9,6 +9,10 @@ import type { AgentRuntimeStatusPublisher } from "../agent/runtimeStatus/types.j
 import { assembleTools, ToolRegistry } from "../agent/tools/index.js";
 import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
+import {
+  evaluateTelegramOnboarding,
+  renderTelegramOnboardingReport,
+} from "../onboarding/index.js";
 import { createCliRenderer } from "./egress/cliRenderer.js";
 import { createTelegramEgressRelay } from "./egress/telegramEgressAdapter.js";
 import { publishCliUserMessage } from "./ingress/cliIngressAdapter.js";
@@ -26,7 +30,6 @@ import {
 } from "../messageBus/index.js";
 
 const CLI_WORKSPACE_SESSION_ID = "cli-stable-session";
-const TELEGRAM_WORKSPACE_SESSION_ID = "telegram-stable-session";
 
 interface SessionRuntime {
   agent: Agent;
@@ -172,21 +175,17 @@ export class MahabotGatewayManager {
   }
 
   async runInTelegramMode(): Promise<void> {
-    const bootstrap = await this.configManager.initializeSessionWorkspace(TELEGRAM_WORKSPACE_SESSION_ID);
+    const onboarding = await evaluateTelegramOnboarding({
+      configManager: this.configManager,
+    });
 
-    if (bootstrap.isFirstConfigCreated) {
-      this.io.output.write(
-        [
-          "Created session config for mahabot.",
-          `Config path: ${bootstrap.configPath}`,
-          "Please fill in required values in the config file, then re-run `mahabot telegram`.",
-          "",
-        ].join("\n"),
-      );
+    if (!onboarding.report.ready || !onboarding.appConfig) {
+      this.io.output.write(renderTelegramOnboardingReport(onboarding.report));
       return;
     }
 
-    const appConfig = await this.configManager.load();
+    const bootstrap = onboarding.report;
+    const appConfig = onboarding.appConfig;
     const telegramConfig = resolveTelegramRuntimeConfig(appConfig, process.env);
 
     const bus = new InMemoryMessageBus({
@@ -438,6 +437,14 @@ export class MahabotGatewayManager {
       process.removeListener("SIGTERM", onSigterm);
       await shutdown("normal_exit");
     }
+  }
+
+  async runTelegramOnboardingMode(): Promise<void> {
+    const { report } = await evaluateTelegramOnboarding({
+      configManager: this.configManager,
+    });
+
+    this.io.output.write(renderTelegramOnboardingReport(report));
   }
 
   private async buildSessionRuntime(
