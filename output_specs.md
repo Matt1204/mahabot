@@ -1,869 +1,830 @@
-# Mahabot Architecture Specification (v1 Baseline for v2 Engineering)
+# Mahabot Project Specification (v1 Baseline for v2 Engineering)
 
-This specification describes the current `mahabot` codebase as implemented in `src/` and validated by `tests/`. It is written for an engineering team that needs to implement, refactor, or extend a v2 system without rediscovering behavior from source.
+This document describes the current `mahabot` repository as implemented in `src/`, supported by `tests/`, and contextualized by `docs/` and `specs/`. It is written for a coding agent or engineering team that should be able to read this file first, understand the project shape, and then read the right code paths intentionally instead of rediscovering everything from scratch.
 
-Conventions used in this document:
-- **Code-verified** means directly confirmed from current source and tests.
-- **Inferred** means derived from architecture intent where code does not enforce it explicitly.
+Conventions:
+- Code-verified: directly confirmed from the current repository source or tests.
+- Inferred: not fully enforced in code, but reasonably derived from the implemented design.
+- File references are repo-relative unless otherwise noted.
 
 ## 1. System Boundary and Context Analysis
 
-`mahabot` is a local-first, single-process Node.js agent runtime that wraps `@mariozechner/pi-agent-core` with project-specific orchestration: session bootstrap, prompt assembly, tool governance, event inspection, message routing, and CLI rendering. The primary objective is to provide a stable command-line assistant workflow where user input is transformed into structured bus envelopes, executed by an agent worker, and rendered back as assistant output and runtime status.
+`mahabot` is a local-first, single-process TypeScript/Node.js assistant runtime. Its core job is to take user messages from supported ingress channels, normalize them into an internal message bus contract, run an LLM agent with configured tools and prompts, persist/compact conversation context, and send assistant output plus runtime status back to the user.
 
-Inside the system boundary:
-- CLI command handling (`src/cli.ts`, `src/gateway/manager.ts`)
-- Session workspace bootstrap and config lifecycle (`src/config/configManager.ts`)
-- Prompt/context assembly (`src/context/contextManager.ts`)
-- Agent orchestration and persistence coordination (`src/agent/agent.ts`, `src/agent/persistence/*`)
-- In-process message bus and worker loop (`src/messageBus/*`, `src/agent/worker/agentWorker.ts`)
-- Tool registry and tool implementations (`src/agent/tools/*`)
-- Runtime event inspection and status publishing (`src/agent/inspection/*`)
+The system purpose is not to be a hosted multi-tenant service. It is a personal agent shell with two runtime modes: CLI and Telegram. CLI mode is optimized for local terminal interaction. Telegram mode is optimized for private text chat through a Telegram bot using long polling. Both modes reuse the same internal runtime chain: `Gateway -> MessageBus -> AgentWorker -> Agent -> pi-agent-core -> MessageBus -> Renderer/Relay`.
 
-Outside the system boundary:
-- LLM provider execution internals (`@mariozechner/pi-ai`, upstream provider APIs)
-- Core agent streaming/state machine internals (`@mariozechner/pi-agent-core`)
-- External web search providers (Tavily, Linkup)
-- OS process model and filesystem permissions beyond app policy constraints
+The operating ecosystem is Node.js >= 20, TypeScript ESM (`moduleResolution: NodeNext`), local filesystem state under `~/.mahabot/<session>/`, environment variables for secrets, Telegraf for Telegram integration, `@mariozechner/pi-agent-core` for agent runtime mechanics, and `@mariozechner/pi-ai` for model/tool schema support. The project is distributed as an npm package with a `mahabot` binary pointing to `dist/cli.js`.
 
-External actors and dependencies:
-- Human CLI user as primary actor.
-- LLM providers selected by config (`agent.llmProviders`).
-- Tavily/Linkup APIs via `web_search` tool.
-- Local filesystem for workspace files and persistence (`session.jsonl`, `history.md`).
+External actors are:
+- Human user in CLI mode, represented as `source: "cli"` and session `cli-stable-session`.
+- Human Telegram user in Telegram mode, represented as `source: "telegram"` and session `tg:<chatId>`.
+- Telegram Bot API, accessed through Telegraf long polling and `sendMessage`.
+- LLM providers configured in `agent.llmProviders`, with credentials read from environment variables.
+- Tavily and Linkup search APIs, accessed by the `web_search` tool.
+- Local operating system, filesystem, and shell subprocesses used by filesystem and bash tools.
 
-Boundary-crossing data flows:
-- User input crosses into the bus as `user_to_agent` envelope payload (`parts[]`).
-- Agent output crosses back as `agent_to_user` text payload with typed runtime kinds.
-- Tool calls cross trust boundary to filesystem, shell, and web APIs.
-- API keys cross via environment variables read at runtime; keys are validated but never intentionally persisted by app logic.
+Inside the system boundary are:
+- Command parsing and process entrypoint: `src/cli.ts`.
+- Runtime orchestration: `src/gateway/manager.ts`.
+- CLI and Telegram ingress adapters: `src/gateway/ingress/*`.
+- CLI and Telegram egress: `src/gateway/egress/*`.
+- In-memory internal transport: `src/messageBus/*`.
+- Agent worker loop: `src/agent/worker/agentWorker.ts`.
+- Agent wrapper, runtime factory, mapper, persistence, inspection, skills, and tools under `src/agent/*`.
+- Configuration and prompt/context assembly under `src/config/*` and `src/context/*`.
+- Tests under `tests/` that define behavioral contracts.
 
-Trust/security boundaries:
-- Boundary A: user input -> internal orchestration (validated envelope contract).
-- Boundary B: agent/tool intent -> privileged operations (filesystem/shell/network), constrained by tool-level policy.
-- Boundary C: local app -> external providers (LLM + search APIs), governed by config + env credentials.
+Outside the system boundary are:
+- LLM provider implementation details and model transport behavior from upstream libraries.
+- Telegram infrastructure availability, rate limits, and bot account management.
+- Tavily/Linkup provider availability, billing, and response evolution.
+- Operating-system-level filesystem permissions beyond checks enforced in app code.
+- Any production deployment, external queue, database, webhook server, or multi-region topology.
 
-Ownership model by boundary:
-- `gateway` owns process lifecycle and session runtime assembly.
-- `agent` owns turn execution, event subscription, and context compaction hooks.
-- `messageBus` owns inter-module transport contract and dispatch isolation.
-- `tools` own execution policy and structured result contracts.
-- `config/context` own runtime configuration validity and prompt materialization.
+Boundary-crossing data and direction:
+- CLI input flows from stdin into `publishCliUserMessage`, then into the bus as `user_to_agent/ui.user_message`.
+- Telegram private text flows from Telegraf middleware into `publishTelegramUserMessage`, then into the same bus contract with Telegram metadata.
+- Agent output flows out as `agent_to_user/agent.assistant_message`.
+- Runtime status flows out as `agent_to_user` kinds: `agent.runtime.event`, `agent.runtime.token_usage`, `agent.runtime.inflight_update`, and `agent.runtime.thinking`.
+- Tool calls cross from agent runtime into local filesystem, shell subprocesses, or web search APIs.
+- Config and prompt files cross from disk into runtime prompt/context assembly.
+- Persisted messages cross from runtime memory to `session.jsonl` and back at startup.
+
+Trust and security boundaries:
+- User text is untrusted until normalized into an envelope and still remains semantically untrusted for agent/tool behavior.
+- MessageBus enforces structural validity, but it does not perform semantic authorization.
+- Telegram ingress applies a user-id whitelist before messages reach the agent.
+- Tool execution is the privileged boundary. Filesystem tools and bash enforce workspace policy when `tools.restrictToWorkspace=true`.
+- Secrets are read from environment variables and config names; the app validates presence but should not persist secret values.
+- The LLM boundary is high risk: prompt, tool outputs, and user text are sent to provider APIs by upstream runtime/model code.
+
+Ownership at each boundary:
+- `gateway` owns process lifecycle, mode selection, session bootstrap, and runtime wiring.
+- `messageBus` owns envelope validation, queueing, waiter wakeup, and subscriber dispatch isolation.
+- `agent/worker` owns bus consumption and assistant envelope publication.
+- `agent/agent` owns serial turn execution, runtime event subscription, persistence hooks, and context compaction.
+- `config` owns config defaults, validation, workspace bootstrap, provider/model resolution support, and secret env-var naming.
+- `context` owns system prompt assembly from session files, runtime metadata, tools, and skills.
+- `tools` own execution policy, parameter schemas, and structured tool result contracts.
+- `inspection` owns conversion of agent events into user-visible runtime status.
 
 ## 2. Overall Architecture Design
 
-Architecture style is a **modular monolith in a single Node.js process**, with event-driven internal messaging and explicit boundaries between ingress, orchestration, runtime, tools, and egress.
+The architecture style is a modular monolith with event-driven internal communication. The process is monolithic because one Node.js process owns ingress, runtime, tools, persistence, and egress. It is modular because source boundaries are explicit: gateway, bus, worker, agent wrapper, config/context, tools, skills, persistence, and inspection each have narrow responsibilities.
 
-Justification for this style:
-- Current use case is local CLI operation with low deployment complexity.
-- In-process message passing avoids distributed consistency and transport overhead.
-- Module-level contracts (`MessageBus`, `ToolRegistry`, `ContextManager`) preserve future extraction seams.
+This style is appropriate for the current product stage because the runtime is personal/local, latency is dominated by LLM/tool calls rather than internal IPC, and a separate service or external queue would add complexity without solving a current requirement. The in-memory bus still gives the project an extraction point: if a future v2 needs a durable queue or multi-process workers, `MessageBus` is the contract to preserve first.
 
-High-level structural diagram (text form):
-- CLI (`src/cli.ts`) -> `MahabotGatewayManager`
-- Gateway bootstraps config/workspace and constructs:
-  - `InMemoryMessageBus`
-  - `ToolRegistry` + assembled tools
-  - `ContextManager`-generated system prompt
-  - `EventInspection` runtime observer
-  - `Agent` runtime wrapper
-  - `AgentWorker` consumer loop
-- User line -> ingress adapter -> bus queue
-- Worker dequeues -> `agent.runCliTurn()` -> tool/LLM loop
-- Worker publishes assistant message envelope
-- Event inspection and in-flight tool publish runtime status envelopes
-- CLI renderer subscribes to bus and writes styled lines to stdout
+High-level structural diagram:
 
-Runtime topology:
-- Single OS process (`node`), single-threaded event loop semantics for JS execution.
-- Child shell subprocesses are spawned per `bash` tool call.
-- No separate service/container decomposition in current implementation.
+```text
+src/cli.ts
+  -> MahabotGatewayManager
+      -> ConfigManager.initializeSessionWorkspace/load
+      -> InMemoryMessageBus
+      -> CLI renderer or Telegram egress relay
+      -> ToolRegistry + assembleTools
+      -> ContextManager.assembleSystemPrompt
+      -> EventInspection
+      -> Agent.createFromAppConfig
+      -> AgentWorker.start
 
-Scalability model:
-- Horizontal scalability is not implemented in-process; sessions are isolated by `sessionId` in memory maps.
-- Vertical scalability relies on event-loop throughput and bounded tool output sizes.
-- Session concurrency is architecturally possible (per-session queues), though current gateway launches one session id (`cli-stable-session`).
+Ingress:
+  CLI readline or Telegraf message
+    -> ingress adapter
+    -> MessageBus user_to_agent queue
+    -> AgentWorker
+    -> Agent.runCliTurn
+    -> pi-agent-core runtime + tools + model
+    -> AgentWorker publishes assistant envelope
+    -> renderer/relay subscriber
 
-Fault tolerance strategy:
-- Subscriber errors are isolated in bus dispatch.
-- Event inspection errors are swallowed and logged; they do not break agent turns.
-- Persistence restore and append failures degrade gracefully with warnings/errors and continue runtime.
-- Worker catches per-turn failures and converts them into `[error] ...` assistant messages.
+Runtime status:
+  pi-agent-core AgentEvent or in_flight_update tool
+    -> EventInspection/status publisher
+    -> MessageBus agent_to_user status queue
+    -> renderer/relay subscriber
+```
+
+Runtime topology is one Node.js process. In CLI mode it owns stdin/stdout and a readline loop. In Telegram mode it owns a Telegraf polling client, one active Telegram runtime, and signal handlers for graceful shutdown. Bash tool calls create child shell subprocesses with timeout and abort handling. No containers, HTTP server, webhook listener, database server, or background daemon are implemented.
+
+The scalability model is intentionally small. Per-session FIFO ingress queues are implemented in memory and could support multiple sessions at the bus level, but gateway policy currently creates one CLI session or one active Telegram chat per process run. There is no queue backpressure, no queue size limit, and no horizontal scale story. v2 should treat unbounded arrays in `InMemoryMessageBus` as a known scaling limit.
+
+Fault tolerance is local and defensive:
+- Bus subscriber failures are caught and logged so one renderer does not break others.
+- Bus dispatch is deferred with `queueMicrotask`, keeping `publish` lightweight.
+- Worker turn failures become user-visible `[error] ...` assistant messages.
+- Event inspection failures are caught and never allowed to break the agent loop.
+- Persistence restore failures start without history; append failures log and keep running.
+- Telegram send failures are caught and logged; they do not crash the process.
+- Shutdown aborts workers and agent runtime, stops Telegraf, and unsubscribes relays.
 
 Deployment model:
-- Local Node package with CLI bin (`mahabot -> dist/cli.js`).
-- Build uses TypeScript compilation + template copy script.
-- Runtime configured through session-local `~/.mahabot/<session>/config.json` + environment variables.
+- Development commands are `npm run dev`, `npm run cli`, and `npm run telegram`.
+- Build command is `npm run build`, which runs `tsc -p tsconfig.json` and copies config templates.
+- Runtime command after build is `mahabot cli`, `mahabot telegram`, or `node dist/cli.js`.
+- Session runtime files are created under `~/.mahabot/<sanitized-session-id>/`.
 
-Multi-region considerations:
-- **Code-verified:** none. Current design is single-node local runtime.
-- **Inferred v2 consideration:** region concerns only matter if externalized to server mode.
+Multi-region considerations are not applicable to the current implementation. Any future hosted v2 would need to redesign session persistence, ingress identity, secret management, queueing, and model/tool execution isolation before multi-region deployment could be meaningful.
 
-Trade-offs and alternatives:
-- Chosen monolith simplifies reasoning, debugging, and testability.
-- It trades off multi-tenant isolation and independent scaling of components.
-- A microservice/event-bus external architecture would improve distributed scaling but introduce significant operational complexity not required by current use case.
+Primary trade-offs:
+- The monolith is easy to read, test, and run locally, but it does not isolate failures across processes.
+- In-memory queues avoid infrastructure, but messages are lost on process exit and can grow without bound.
+- Telegram long polling is simple for personal use, but webhook mode would be better for hosted production.
+- Workspace-local tool restriction reduces accidental damage, but bash static policy cannot prove all command safety.
 
 ## 3. Complete Module Breakdown
 
-### 3.1 CLI Entrypoint Module (`src/cli.ts`)
+### CLI Entrypoint (`src/cli.ts`)
 
-Responsibility and scope:
-- Parses command args and dispatches supported command (`cli`) into gateway manager.
+The CLI entrypoint owns command parsing and top-level process error handling. It recognizes `cli`, `telegram`, and help flags. It constructs `MahabotGatewayManager` and delegates to `runInCliMode()` or `runInTelegramMode()`. It does not own session state, config validation, prompt assembly, or agent behavior.
 
-Owned logic/state:
-- Minimal command parsing (`help`, first non-flag command).
-- Process-level error handling (`main().catch`).
+Inputs are `process.argv` and environment already loaded through `dotenv.config()`. Outputs are help text, top-level error text, and `process.exitCode=1` on failure. Its error model is intentionally simple: unknown commands throw, and `main().catch` reports `mahabot failed:`.
 
-Non-owned concerns:
-- No session orchestration, no agent lifecycle details.
+### Gateway Manager (`src/gateway/manager.ts`)
 
-Interfaces:
-- Input: `process.argv`.
-- Output: stdout/stderr and process exit code.
+The gateway manager is the process lifecycle orchestrator. In both modes it initializes a session workspace, loads config, creates an `InMemoryMessageBus`, assembles tools, assembles the system prompt, creates an `EventInspection`, creates an `Agent`, creates an `AgentWorker`, starts the worker, and tears everything down during exit.
 
-Error handling:
-- Throws on unknown command; top-level catch logs `mahabot failed`.
+In CLI mode it owns a readline loop and handles local commands:
+- `/help` prints static command help.
+- `/clear` stops the current worker and agent, rebuilds runtime with the same bus/session paths, and reloads system prompt.
+- `/exit`, `exit`, `quit`, or `:q` ends the loop.
 
-Concurrency and performance:
-- None beyond single startup path.
+In Telegram mode it owns:
+- Telegraf bot construction from resolved runtime config.
+- Private-text-only handling.
+- User-id whitelist enforcement.
+- One-active-chat-per-process policy.
+- Lazy runtime activation on the first accepted chat.
+- Relay subscription from bus to Telegram `sendMessage`.
+- SIGINT/SIGTERM cleanup.
 
-### 3.2 Gateway Manager Module (`src/gateway/manager.ts`)
+State is mostly runtime-local: active runtime, active chat id, shutdown flag, and activation promise. Persistence is delegated to the `Agent` through `messagePersistence` config. Errors during first config creation are not failures; the gateway prints the config path and exits so the user can fill required values.
 
-Responsibility and scope:
-- End-to-end session bootstrap and runtime wiring for CLI mode.
-- Lifecycle owner for bus, renderer subscription, worker start/stop, and `/clear` rebuild.
+### CLI Ingress Adapter (`src/gateway/ingress/cliIngressAdapter.ts`)
 
-Owned data/logic/state:
-- Session-scoped runtime bundle `{ agent, worker }`.
-- Runtime status publisher mapping to bus envelope format.
+The CLI ingress adapter converts non-empty trimmed terminal text into a `BusEnvelope<UserToAgentPayload>`. It publishes `direction: "user_to_agent"`, `kind: "ui.user_message"`, `source: "cli"`, `priority: "high"`, and one text part. It owns no state. Empty messages are ignored before publication.
 
-Non-owned concerns:
-- Does not execute turns directly; delegates to `AgentWorker`.
+### Telegram Ingress and Access Policy (`src/gateway/ingress/telegram*.ts`)
 
-Public interface:
-- `runInCliMode(): Promise<void>`.
+Telegram runtime config resolution validates that Telegram mode is enabled, the whitelist is non-empty, and the bot token environment variable exists. It returns the token and a `ReadonlySet<string>` of allowed user ids.
 
-Inputs/outputs:
-- Inputs: user CLI lines, loaded app config, workspace paths.
-- Outputs: bus publications, rendered terminal output.
+The access policy enforces two rules:
+- The Telegram `from.id` must be in `allowedUserIds`.
+- The first accepted chat becomes the active chat for the process run; later messages from another chat are rejected.
 
-State management:
-- Replaces runtime on `/clear` by stopping old components and rebuilding fresh instances.
+The Telegram ingress adapter trims text, ignores whitespace-only messages, publishes `source: "telegram"`, and attaches Telegram identity metadata (`chatId`, `userId`, `username`, `firstName`, `lastName`). Even though the config field is named `allowedChatIds`, docs and code treat it as Telegram user-id whitelist.
 
-Persistence strategy:
-- Delegated to `Agent` via message persistence config.
+### CLI Renderer (`src/gateway/egress/cliRenderer.ts`)
 
-Error handling:
-- Bootstrap first-run creates config and exits with guidance.
-- `/clear` failures are printed as `bot> [error] ...`.
+The CLI renderer subscribes to `agent_to_user` envelopes for one session. Assistant messages render as `bot> ...`; runtime status messages render as plain lines or ANSI-styled dim/secondary lines. It does not consume user messages. Its public interface is `createCliRenderer(...) => unsubscribe`.
 
-Concurrency model:
-- User input loop is sequential; worker runs async consume loop.
+### Telegram Egress Relay (`src/gateway/egress/telegramEgressAdapter.ts`)
 
-Security model:
-- Passes workspace root and restriction flags into tool assembly to enforce policy at tool layer.
+The Telegram relay subscribes to `agent_to_user` envelopes for one session and forwards `payload.text` to the active Telegram chat through `sendMessage`. It forwards both assistant messages and runtime status. It catches send errors and logs warnings, so a Telegram delivery failure does not crash the runtime.
 
-Performance constraints:
-- Depends on bus responsiveness and agent turn latency.
+### Message Bus (`src/messageBus/*`)
 
-Separation rationale:
-- Keeps orchestration concerns separate from agent logic, enabling ingress/egress variants later.
+The message bus is the internal transport contract. `types.ts` defines envelope shape, directions, priorities, payloads, and allowed message kinds. `kindRegistry.ts` validates top-level envelope fields, direction-kind compatibility, user payload parts, and agent payload text. `id.ts` creates process-local ids like `msg_<timestamp>_<seq>`.
 
-### 3.3 Message Bus Module (`src/messageBus/*`)
+`InMemoryMessageBus` owns:
+- `ingressQueue`: global user ingress diagnostic log.
+- `assistantEgressQueue`: assistant message diagnostic queue.
+- `statusEgressQueue`: runtime status diagnostic queue.
+- `ingressBySession`: real per-session FIFO inbox consumed by workers.
+- `waitersBySession`: pending consumers blocked on empty queues.
+- `subscribers`: renderer/relay/status consumers.
 
-Responsibility and scope:
-- Provide contract-validated, session-aware in-memory transport between user ingress, worker, and UI subscribers.
+The bus is in-memory only. It does not persist messages, enforce authorization, deduplicate envelopes, cap queue size, retry subscribers, or guarantee exactly-once delivery beyond the current process.
 
-Owned data:
-- Per-session ingress queue map.
-- Pending waiter map for event-driven awaiters.
-- Egress snapshots (assistant/status).
+### Agent Worker (`src/agent/worker/agentWorker.ts`)
 
-Public interface:
-- `publish`, `getUserMsgFromBus`, `subscribe`, `getQueues`.
+`AgentWorker` bridges bus ingress to agent turns. It starts one loop per instance, waits on `bus.getUserMsgFromBus(sessionId, signal)`, maps user parts into text, calls `agent.runCliTurn(...)`, and publishes an `agent.assistant_message` envelope. Image parts are preserved only as textual placeholders (`[image] <url>`) because the current agent path is text-based.
 
-Data transformations:
-- Direction/kind validation via `kindRegistry`.
-- Routing user envelopes into both global ingress log and session queue.
+The worker catches turn errors and publishes `[error] <error>` as assistant output. Stop uses `AbortController` so a parked bus waiter rejects with `AbortError` and the loop exits cleanly.
 
-State/persistence:
-- In-memory only; no durable queue backing.
+### Agent Runtime Wrapper (`src/agent/agent.ts`, `src/agent/runtime/*`, `src/agent/mappers/*`)
 
-Error handling:
-- Rejects invalid envelopes synchronously.
-- Isolates subscriber handler errors via per-handler try/catch.
+`Agent` wraps `@mariozechner/pi-agent-core` and adds application behavior:
+- Static construction from `AppConfig`.
+- Model resolution and provider credential checks.
+- Tool assembly through `ToolRegistry`.
+- Serial turn execution with `runExclusive`.
+- Startup restore from persisted messages.
+- Turn-end token usage tracking for context compaction.
+- Event subscription and inspection callback isolation.
+- Mapping between temporary inbound/outbound app messages and `AgentMessage`.
+- Stop-time persistence and runtime abort/wait-for-idle.
 
-Concurrency:
-- FIFO per session via array shift.
-- Waiters resolved one-at-a-time, oldest-first per session.
+The runtime factory creates a `PiAgent` with system prompt, selected model, thinking level, registered tools, optional transport/payload hooks, and a default `convertToLlm` that allows only `user`, `assistant`, and `toolResult` roles through. The mapper suppresses thinking-only content from user output, joins text blocks, and returns a tool-call summary if an assistant message contains tool calls but no text.
 
-Security model:
-- Contract enforcement prevents illegal kind-direction mixes and malformed payloads.
+### Message Persistence (`src/agent/persistence/*`)
 
-Performance constraints:
-- Unbounded arrays (known risk); dispatch deferred to microtask.
+Persistence is JSONL-based. `JsonlMessageStore` appends records with `schemaVersion: 1`, `sessionId`, `persistedAt`, and raw `AgentMessage`. It reads all records, skips malformed non-final lines, ignores malformed trailing JSONL, and skips records for unexpected sessions.
 
-Separation rationale:
-- Decouples producer/consumer modules and allows future transport replacement.
+`MessagePersistenceCoordinator` restores an aligned startup window, tracks a runtime cursor over in-memory messages, appends pending messages, and compacts context when token usage reaches the high watermark. Compaction calculates an approximate keep count based on `low/high` watermark ratio, aligns the retained tail to a completed assistant turn, persists before dropping messages, and adjusts the cursor.
 
-### 3.4 Agent Worker Module (`src/agent/worker/agentWorker.ts`)
+`windowAlignment.ts` defines the key invariant: retained windows must end at an assistant turn end and prefer starting at a user boundary. A dangling final user message is not restored as the tail because it does not represent a completed turn.
 
-Responsibility:
-- Bridge message bus ingress to agent turn execution and publish assistant responses.
+### Config (`src/config/*`)
 
-Owned logic:
-- Long-running consume-execute-publish loop with abort support.
-- Conversion from structured user parts to plain CLI text (`[image] url` placeholder).
+`ConfigManager` owns session workspace creation, config loading/saving, default merging, validation, provider credential lookup, provider/model selection, and prompt scaffold recovery. It creates:
+- Session root: `~/.mahabot/<sanitized-session-id>/`.
+- Workspace root: `<sessionRoot>/workspace`.
+- Persistence root: `<workspaceRoot>/persistence`.
+- Skills root: `<workspaceRoot>/skills`.
+- Config: `<sessionRoot>/config.json`.
+- Prompt files: `<sessionRoot>/AGENTS.md`, `<workspaceRoot>/SOUL.md`, `<workspaceRoot>/USER.md`.
+- Persistence files: `history.md` and `session.jsonl`.
 
-Non-owned:
-- Does not manage agent internals or system prompt.
+Config validation is strict. It rejects removed provider-level `model`, removed `modelFactoryDefaults`, removed model override keys, removed `agent.runtimeStatus`, invalid watermark ordering, invalid Telegram config, and unsupported tool config shapes. Arrays replace during deep merge rather than merging item-by-item.
 
-Interfaces:
-- Consumes `MessageBus` and `Agent`.
-- Publishes `agent.assistant_message` envelopes.
+The model factory resolves requested provider/model, then active provider/model, then default provider/model. It supports custom OpenAI-compatible providers when `category: "openai"` and `baseUrl` are set, using internal defaults for cost/context/max tokens.
 
-Error handling:
-- Turn-level errors converted to user-visible `[error] ...` assistant messages.
+### Context Manager (`src/context/*`)
 
-Concurrency:
-- One running loop per worker instance.
+`ContextManager` assembles the system prompt from ordered sections:
+- Required `AGENTS.md` from session root.
+- Runtime context including session id, platform, node, python, workspace paths, and persistence paths.
+- Tool rule prompts from registered tools.
+- Optional `SOUL.md` and `USER.md` from workspace root, recreated from templates if missing.
+- Skills metadata rendered as XML.
 
-Security:
-- No direct external side effects except bus publication.
+It logs skill scan diagnostics and returns both the assembled prompt and section diagnostics. It does not currently inject long-term memory summaries from `history.md`; that file is reserved by prompt text and runtime metadata.
 
-### 3.5 Agent Runtime Wrapper (`src/agent/agent.ts` + runtime factory + mapper)
+### Skills Catalog (`src/agent/skills/*`)
 
-Responsibility:
-- Wrap `pi-agent-core` with app-specific behaviors: startup restore, serial turn exclusivity, event observation, context compaction, and message persistence.
+Skills are discovered from builtin and workspace skill roots by scanning direct child directories for `SKILL.md`. Frontmatter is parsed with `yaml`. A valid skill has a name and description, with fallback behavior for missing name/description and warnings for guide violations. Workspace skills override builtin skills with the same name, and the final list is sorted by name.
 
-Owned state:
-- `running` flags, abort controllers, serial promise queue, persistence coordinator.
+Only metadata is inserted into the prompt. The skill body must be read later by tool use when a skill is actually needed. This keeps prompt size small while preserving discoverability.
 
-Public interfaces:
-- `createFromAppConfig`, `start/stop`, `runCliTurn`, `continue`, `abort`, `waitForIdle`, `reset`, steering/follow-up injection helpers.
+### Tool Registry and Assembly (`src/agent/tools/registry/*`)
 
-Inputs/outputs:
-- Input: inbound text and assembled memory bundle.
-- Output: outbound text generated from assistant message mapping.
+`ToolRegistry` stores ordered tools and enforces globally unique names. Standard tools are allowed. Add-on registration exists as an interface but intentionally throws in this phase. `ToolAssembly` is the central policy point for available tools.
 
-Data transformation:
-- `InboundMessageTemp` + memory -> `AgentMessage[]`.
-- assistant `AgentMessage` -> human text extraction that suppresses thinking-only content.
+Standard tools include:
+- `show_runtime_info`
+- `web_search`
+- `in_flight_update` when runtime status publisher is available
+- `bash`, `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `list_tree` when `workspaceRoot` is available
+- showcase/debug tools through imported modules where used by assembly policy
 
-State management:
-- First queued task waits for startup context restore promise.
-- `runExclusive` ensures one turn-at-a-time semantics even if callers race.
+Filesystem and bash tools are skipped if no workspace root is passed, which prevents unsafe fallback construction paths from exposing privileged tools.
 
-Persistence strategy:
-- On startup: load aligned tail window from `session.jsonl`.
-- On turn-end: track token usage and compact context if high watermark exceeded.
-- On stop/compaction: persist pending message tail.
+### Filesystem Tools (`src/agent/tools/*FileTool.ts`, `grepTool.ts`, `globTool.ts`, `listTreeTool.ts`, `filesystem_shared/*`)
 
-Error handling:
-- Event observer errors are isolated.
-- Restore/persist failures do not crash agent; warnings logged.
+Filesystem tools share policy helpers in `filesystem_shared/core.ts`. They canonicalize paths, reject empty/null/overlong paths, resolve symlinks through existing ancestors, and enforce `restrictToWorkspace` unless an additional allowed root is configured. `read_file` uniquely allows builtin skill files outside workspace so skill workflows can read builtin `SKILL.md`.
 
-Concurrency model:
-- Serial queue for all turn-invoking operations.
+Tool responsibilities:
+- `read_file`: UTF-8 paginated reads with offset/maxBytes and truncation metadata.
+- `write_file`: overwrite/create/append UTF-8 text with optional parent creation and SHA precondition.
+- `edit_file`: exact text replacement with occurrence selection, dry-run, SHA precondition, and preview diff.
+- `grep`: bounded recursive text search with literal/regex mode, include/exclude globs, hidden/binary skipping, context lines, and truncation metadata.
+- `glob`: bounded recursive path matching with include/exclude globs, file/dir mode, hidden control, symlink cycle detection.
+- `list_tree`: bounded directory traversal with max depth, max entries, hidden control, and sibling sorting.
 
-Security:
-- Relies on tool policy and config credential checks.
+### Bash Tool (`src/agent/tools/bashTool.ts`)
 
-Performance constraints:
-- Context compaction ratio based on watermark target and message count.
+The bash tool runs a command in a new shell process with a fixed timeout of 120 seconds, stdout/stderr byte limits, and abort support. It keeps a logical current working directory across calls, but shell state itself does not persist. It blocks known destructive commands (`rm -rf`, `mkfs`, shutdown/reboot/halt/poweroff, fork bomb patterns), destructive git operations (`git reset --hard`, `git clean -fd`), and high-risk unverifiable command shapes in restricted mode (`curl | sh`, `sudo`, shell `-c`, command substitution, backticks).
 
-### 3.6 Persistence Subsystem (`src/agent/persistence/*`)
+When workspace restriction is enabled, the tool checks effective working directory and command path behavior using policy helpers. Static command analysis is necessarily conservative; v2 should continue treating bash as the highest-risk built-in tool.
 
-Responsibility:
-- Durable append-only JSONL storage and bounded context reconstruction.
+### Web Search Tool (`src/agent/tools/webSearchTool.ts`)
 
-Components:
-- `JsonlMessageStore`: append/read, tolerant parse for malformed trailing line and session mismatch filtering.
-- `windowAlignment`: turn-boundary-safe tail slicing.
-- `MessagePersistenceCoordinator`: cursor tracking, restore/persist/compact orchestration.
+`web_search` provides a single agent-facing search API over Tavily first and Linkup fallback. It accepts focused query parameters, date filters, domain include/exclude lists, and `max_results` up to 10. It calls Tavily first. It falls back to Linkup only when Tavily reports insufficient credits/usage limit. Tavily 429 rate limit does not trigger fallback by design.
 
-Consistency behavior:
-- Compaction persists before dropping messages to avoid data loss.
-- Cursor is adjusted when compaction drops head messages.
+Results are normalized into URL plus description with provider metadata. Errors are structured with codes such as `invalid_input`, `tavily_failed_non_credit`, `all_providers_insufficient_credits`, `network_error`, and provider payload errors. API keys are read from environment variables configured in `tools.webSearch`.
 
-Failure behavior:
-- Append errors reported; cursor not advanced.
-- Restore errors return empty/default runtime messages.
+### Runtime Status and Event Inspection (`src/agent/inspection/*`, `src/agent/runtimeStatus/types.ts`, `src/agent/tools/inFlightUpdateTool.ts`)
 
-### 3.7 Context Assembly Module (`src/context/contextManager.ts`)
+Runtime status is user-visible but non-final. `EventInspection` subscribes to `AgentEvent` through `Agent.onAgentEvent`, defers processing via microtasks, formats configured event kinds, emits token usage on turn end when enabled, and emits complete thinking text on `thinking_end` when thinking inspection is enabled.
 
-Responsibility:
-- Compose system prompt from scaffold files, runtime metadata, tool prompts, and skill catalog summary.
-
-Owned logic:
-- Required `AGENTS.md` read.
-- Optional `SOUL.md` / `USER.md` auto-scaffold if missing.
-- Skills metadata scan from builtin and workspace roots.
-
-Interfaces:
-- `assembleSystemPrompt(sessionId, sessionRoot, workspaceRoot, persistenceRoot, toolRegistry)`.
-
-Security/trust:
-- Includes paths and runtime metadata in prompt; does not include skill body by default, only metadata summary.
-
-### 3.8 Skills Catalog Module (`src/agent/skills/*`)
-
-Responsibility:
-- Discover skill directories, parse YAML frontmatter, generate metadata XML summary.
-
-Behavior:
-- Workspace skills override builtin by skill name.
-- Parse failures are warnings and skip loading.
-- Description guideline violations are warned but accepted.
-
-### 3.9 Configuration Module (`src/config/*`)
-
-Responsibility:
-- Manage schema-validated app config, workspace bootstrap, provider/model resolution, and credential access.
-
-Owned logic:
-- Deep-merge defaults with user config.
-- Strict rejection of removed/unsupported schema keys.
-- Active/default provider-model pair validation.
-- Template lookup fallback chain and session directory initialization.
-
-Security model:
-- API keys fetched from env vars; explicit `ensureProviderCredentials` validation before runtime creation.
-
-### 3.10 Tooling Subsystem (`src/agent/tools/*`)
-
-Responsibility:
-- Register and execute capability tools with typed schemas and policy-bound side effects.
-
-Registered standard tools in context-aware mode:
-- `show_runtime_info`, `web_search`, optional `in_flight_update`, plus filesystem/shell tools when workspace root exists: `bash`, `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `list_tree`.
-
-Registry behavior:
-- Ordered registration with duplicate-name rejection.
-- Add-on registration intentionally disabled.
-
-Security/performance highlights:
-- Filesystem tools enforce workspace boundary (with `read_file` special allowance for builtin skills root).
-- `bash` has blacklist/high-risk/workspace policy gates and fixed timeout.
-- Tool outputs are bounded and structured with details payloads.
-
-### 3.11 Event Inspection Module (`src/agent/inspection/*`)
-
-Responsibility:
-- Convert low-level `AgentEvent` stream into user-visible runtime status lines and token-usage/thinking summaries.
-
-Behavior:
-- Two-stage microtask deferral to minimize runtime callback blocking.
-- Deduplicates token usage emissions by fingerprint.
-- Tracks thinking stream fragments and emits finalized thinking text on `thinking_end` only.
-
-### 3.12 CLI Egress/Ingress Adapters (`src/gateway/egress`, `src/gateway/ingress`)
-
-Responsibility:
-- Transform raw CLI input into bus envelope and render agent/status envelopes to terminal with optional ANSI styling.
-
-Contract:
-- `ui.user_message` carries text-only parts from CLI.
-- `agent.assistant_message` rendered as `bot>`.
-- Runtime status rendered dim/secondary/blue based on kind/style.
+`in_flight_update` is a tool-call-driven progress/status path. It validates message length, optional next step, optional integer progress percent, stage, and dedupe key. On success it publishes `agent.runtime.inflight_update`; on validation or sink failure it returns structured failure details. The default prompt rule asks an assistant to pair this tool with other tool calls in the same batch.
 
 ## 4. Inter-Module Relationships and Communication
 
-Primary synchronous/async chain for normal execution:
-1. User types line in gateway readline loop.
-2. `publishCliUserMessage` emits `user_to_agent/ui.user_message` to bus.
-3. `AgentWorker` awaits `getUserMsgFromBus(sessionId)` and receives envelope FIFO.
-4. Worker calls `agent.runCliTurn(...)`.
-5. Agent maps message, prompts runtime, may execute tools, parses assistant output.
-6. Worker publishes `agent.assistant_message` envelope.
-7. CLI renderer subscriber prints assistant line.
-8. In parallel, event inspection may publish `agent.runtime.*` envelopes for tool/activity/thinking/token status.
+CLI entrypoint to Gateway is a direct synchronous construction plus awaited method call. There is no retry or timeout policy here; failures propagate to top-level catch. This boundary is intentionally thin.
 
-Communication protocol by module pair:
+Gateway to ConfigManager is direct async method calls. Startup creates or loads session files. Config validation failures are fatal for the mode because an invalid config can produce unsafe model/tool behavior. First-run missing config is handled as a guided setup path rather than an exception.
 
-Gateway -> MessageBus:
-- Direction: producer only.
-- Protocol: in-memory method call `publish`.
-- Sync vs async: synchronous publish + async microtask dispatch to subscribers.
-- Retry/timeout: none; failures are thrown for invalid payloads.
-- Ordering: publish order preserved per event-loop execution.
+Gateway to ContextManager is direct async prompt assembly. Missing required prompt files are fatal with remediation text. Missing optional `SOUL.md` or `USER.md` triggers template recovery and warning logs. There is no retry loop because these are local filesystem operations.
 
-MessageBus -> AgentWorker:
-- Direction: consumer pull (`getUserMsgFromBus`).
-- Sync vs async: promise-based; immediate dequeue or parked waiter.
-- Timeout: none; cancellation via `AbortSignal`.
-- Retry: worker loop continues after non-abort errors.
-- Ordering: FIFO per session queue.
-- Consistency: at-most-once dequeue from in-memory queue (no persistence).
+Gateway to ToolAssembly/ToolRegistry is direct in-memory registration. The exchanged schema is `DescribedAgentTool`, which extends upstream `AgentTool` with optional `toolRulePrompt`. Duplicate names throw immediately. This is a startup-time transaction boundary: if tool registration fails, runtime creation should fail before accepting messages.
 
-AgentWorker -> Agent:
-- Direction: direct call.
-- Protocol: in-process function invocation.
-- Timeout: none at wrapper layer; downstream tool-level timeouts apply (`bash` 120s).
-- Idempotency: not guaranteed; repeated invocation repeats turn execution.
-- Transaction boundary: one `runCliTurn` is logical transaction unit.
+Ingress adapters to MessageBus communicate by direct `publish(envelope)`. Protocol is in-process method call. It is synchronous for validation and queue mutation, asynchronous for subscriber side effects. Invalid envelopes throw synchronously. There is no retry because producer code should construct valid envelopes.
 
-Agent/EventInspection -> MessageBus:
-- Direction: status publication callback.
-- Protocol: runtime status converted to `agent_to_user` envelopes.
-- Failure propagation: publish errors are not expected in normal flow; inspection publish wrapper catches and logs failures.
+MessageBus to AgentWorker communicates through `getUserMsgFromBus(sessionId, AbortSignal)`. This is async and event-driven. If a message is queued, it resolves immediately. If not, it stores a waiter and resolves when a future publish arrives. Ordering is FIFO per session. Abort rejects with an `AbortError`. There is no timeout policy; worker waits until message or abort.
 
-MessageBus -> CLI Renderer:
-- Direction: pub-sub callback.
-- Async semantics: dispatch via microtask.
-- Failure isolation: renderer exceptions do not poison other subscribers.
+AgentWorker to Agent communicates through `runCliTurn(text, channel, chatId, userId)`. Despite the name, it is used by both CLI and Telegram because the current agent path is text-oriented. Calls are awaited. Agent itself serializes concurrent calls with an internal promise queue, so the module pair has at-most-one-turn-in-runtime semantics.
 
-Normal flow rationale:
-- Decoupling rendering from execution prevents output concerns from blocking worker execution.
+Agent to pi-agent-core communicates by direct runtime API calls: `prompt`, `continue`, `abort`, `waitForIdle`, `replaceMessages`, `subscribe`, `state`. The protocol is upstream library object API. Retry strategy is delegated to upstream runtime/model configuration (`maxRetryDelayMs` exists in config type but is not set by gateway). Failure propagates to worker and becomes `[error]` output.
+
+Agent to PersistenceCoordinator is direct async. Persistence append is best effort: append failure logs and does not abort the user turn. Compaction has a stricter internal boundary: it persists pending messages before replacing runtime state; if persistence does not reach the full cursor, compaction is skipped to avoid dropping unpersisted messages.
+
+Agent/EventInspection to MessageBus communicates through a status publisher closure created by Gateway. This publishes `agent_to_user` runtime envelopes. It is asynchronous at inspection level via microtasks and synchronous at bus validation/queue mutation. Inspection failures are isolated and logged.
+
+MessageBus to CLI Renderer and Telegram Relay communicates through subscriptions. Subscriber dispatch is deferred to a microtask. Matching is by direction, optional session id, and optional kinds. Subscriber exceptions are caught and logged. There is no retry, no timeout, and no circuit breaker. Telegram send failures are caught inside relay.
+
+Normal CLI flow:
+1. User enters a line in readline.
+2. Gateway handles local slash commands or calls `publishCliUserMessage`.
+3. Bus validates and enqueues `ui.user_message`.
+4. Worker wakes or later dequeues by session.
+5. Worker converts parts to text and calls `Agent.runCliTurn`.
+6. Agent maps inbound to `AgentMessage[]`, invokes pi-agent-core, compacts/persists as needed, extracts assistant text.
+7. Worker publishes `agent.assistant_message`.
+8. CLI renderer prints `bot> ...`.
+
+Normal Telegram flow:
+1. Telegraf receives private text message.
+2. Gateway rejects non-private or non-text messages early.
+3. Gateway evaluates whitelist and active-chat policy.
+4. First accepted chat lazily creates runtime with session `tg:<chatId>` and relay subscription.
+5. Telegram ingress publishes `ui.user_message` with Telegram metadata.
+6. Shared bus/worker/agent path runs.
+7. Telegram relay forwards assistant and runtime status text to the active chat.
 
 Failure scenarios:
-- Invalid envelope publish throws immediately at producer.
-- Worker turn error yields user-visible assistant error envelope; loop continues.
-- Persistence append failure logs error and continues with in-memory state.
-- Event inspection failure is swallowed and does not interrupt agent runtime.
+- Invalid config: startup fails before worker starts.
+- Missing first-run config: template is created and process exits with guidance.
+- Non-whitelisted Telegram user: message is rejected and never reaches MessageBus.
+- Different Telegram chat after activation: rejected without agent execution.
+- Bus envelope invalid: publish throws; current producer path generally treats this as programming error.
+- Agent turn failure: worker publishes `[error] ...`.
+- Persistence restore failure: warning and empty/current context.
+- Persistence append failure: error log and no cursor advancement.
+- Subscriber/renderer failure: logged; other subscribers continue.
+- Telegram send failure: warning; runtime keeps processing later messages.
 
-Retry scenarios:
-- `web_search` internal fallback only from Tavily insufficient-credits to Linkup; other failures do not trigger fallback.
-- No generic cross-module retry middleware exists.
+Retry scenarios are minimal. No internal queue retry exists. Web search has provider fallback only for Tavily credit exhaustion. Bash has no retry. LLM retry/backoff, if any, is handled by upstream pi-agent runtime/model behavior.
 
-Partial outage behavior:
-- If status publication fails, assistant messages can still flow.
-- If persistence fails, chat remains functional but durability guarantees degrade.
-- If external providers fail (LLM/web search), user receives failure text; process remains alive.
+Partial outages:
+- Telegram API outage affects only Telegram relay/ingress; CLI mode is unaffected.
+- Search provider outage affects only `web_search`.
+- Persistence filesystem failure affects history durability/compaction but not immediate turn execution unless startup prompt files/config are unreadable.
+- Event inspection failure affects only runtime status visibility.
 
-Circuit breaking and transactional scope:
-- No explicit circuit breaker implementation.
-- Transaction boundaries are coarse-grained per turn and per tool execution.
-
-Consistency guarantees:
-- Strong ordering per session for ingress dequeue.
-- Eventual rendering for published envelopes (microtask scheduling).
-- Durable history only for successfully appended JSONL records.
+Communication model rationale: direct method calls keep simple module boundaries; MessageBus is used only where decoupling producer/consumer timing matters.
 
 ## 5. Domain Model and Behavior Design
 
-Core entities and value objects:
-- `BusEnvelope<TPayload>`: canonical transport envelope with identity, session scope, direction, kind, priority, payload.
-- `InboundMessageTemp` / `OutboundMessageTemp`: agent-facing temporary conversational structures for CLI flow.
-- `AgentMessage` (from upstream runtime): canonical LLM/tool/assistant history objects.
-- `PersistedMessageRecord`: append-only JSONL record containing schema version, session id, timestamp, message.
-- `ContextBudgetSnapshot`: token usage watermark state for compaction policy.
-- `SkillMetadata`: name/description/location extracted from skill frontmatter.
-- Tool-specific `details` objects (filesystem/search/bash/web_search/inflight) as machine-consumable execution contracts.
+Core entities:
+- Session: logical conversation runtime identified by `workspaceSessionId` such as `cli-stable-session`, `telegram-stable-session`, or active message session `tg:<chatId>`.
+- WorkspaceBootstrapResult: filesystem roots and config path for a session.
+- AppConfig: validated runtime configuration.
+- BusEnvelope: typed transport unit with id, sessionId, timestamp, direction, source, kind, priority, payload, render hints, and metadata.
+- UserToAgentPayload: non-empty array of text or image parts.
+- AgentToUserPayload: non-empty text plus optional format/raw details.
+- Agent: runtime wrapper around pi-agent-core state and methods.
+- AgentWorker: session-bound consumer/executor.
+- ToolRegistry: ordered set of unique tools.
+- DescribedAgentTool: executable tool plus optional rule prompt.
+- PersistedMessageRecord: JSONL record containing one `AgentMessage`.
+- SkillMetadata: skill name, description, and `SKILL.md` location.
 
-Aggregate ownership:
-- Gateway owns session runtime aggregate (agent + worker + bus + renderer subscription).
-- Agent owns runtime message history and compaction/persistence cursor behavior.
-- MessageBus owns ingress/egress queue states and waiter lifecycle.
+Relationships and ownership:
+- Gateway owns the live SessionRuntime bundle.
+- AgentWorker owns session consumption from MessageBus but does not own bus storage.
+- Agent owns pi-agent-core state and persistence cursor coordination.
+- MessageBus owns envelopes only while in memory; persistence stores agent messages, not bus envelopes.
+- ConfigManager owns app config shape and workspace bootstrap paths.
+- ContextManager owns prompt section assembly but not the contents of user-authored prompt files.
 
-Key invariants (code-verified):
-- `MessageKind` must match `direction` category.
-- `user_to_agent` payload must contain non-empty `parts`.
-- `agent_to_user` payload must contain non-empty `text`.
-- Tool names are globally unique in registry.
-- Compaction low watermark must be strictly less than high watermark.
-- Provider-model pair selected as active/default must exist among enabled providers.
-- `eventInspection.thinking.emitMode` must be `on_end`.
+Important invariants:
+- `user_to_agent` envelopes may only use `ui.user_message`.
+- `agent_to_user` envelopes may only use assistant/runtime kinds.
+- User payload parts must be non-empty and each part must be text or image.
+- Agent payload text must be non-empty.
+- Per-session user ingress consumption is FIFO.
+- A worker consumes only its configured `sessionId`.
+- Agent turns are serialized through `runExclusive`.
+- Startup restore and compaction windows must end at an assistant turn end.
+- Thinking-only assistant content must not be shown as final user output.
+- Telegram messages from non-whitelisted users must not reach agent execution.
+- Filesystem writes/edits must stay within workspace when restriction is enabled.
 
 State machines:
+- CLI process: not started -> bootstrap -> first config created exit or loaded -> worker running -> exit command/finally -> stopped.
+- Telegram process: not started -> bootstrap -> config resolved -> polling -> first accepted chat activates runtime -> active runtime -> signal/normal exit -> stopped.
+- AgentWorker: stopped -> running with waiter/turn loop -> aborting -> stopped.
+- Agent turn: inbound received -> memory assembled -> prompt invoked -> assistant message found -> outbound mapped -> pending persistence/compaction -> complete.
+- Persistence context: empty/current -> restored tail -> pending messages accumulate -> persisted on stop/compaction -> compacted tail replaces runtime messages when watermark exceeded.
 
-Session runtime lifecycle:
-- Bootstrapped -> Running worker -> Stopped/Disposed -> Rebuilt on `/clear`.
-- Forbidden transition: concurrent `start` duplicates are ignored by idempotent checks.
+Allowed transitions:
+- `/clear` in CLI can stop runtime and rebuild it.
+- Telegram can activate from no active chat to one active chat.
+- Agent can abort/wait/stop from running state.
+- Config can be updated/saved through `ConfigManager`, but runtime uses loaded clone values.
 
-Worker loop lifecycle:
-- Idle waiting on bus -> Consuming envelope -> Executing turn -> Publishing output -> back to waiting.
-- Abort transitions waiting/executing loop to stopped state.
+Forbidden transitions:
+- Telegram non-private chats cannot enter runtime.
+- Telegram other chat cannot replace active chat during one process run.
+- Add-on tool registration cannot succeed in this phase.
+- Config legacy shapes such as provider-level `model`, `modelFactoryDefaults`, `params.agent`, and `params.stream` are rejected.
+- Context compaction cannot drop messages unless pending messages were persisted.
 
-Agent turn lifecycle:
-- inbound mapped -> runtime prompt -> zero or more tool calls/events -> assistant message located -> parsed outbound.
-- Post-turn hook updates token usage and optionally compacts context.
+Business rules:
+- Empty CLI/Telegram messages are ignored.
+- Telegram whitelist uses `from.id`, not `chat.id`, despite field name `allowedChatIds`.
+- `web_search` falls back to Linkup only for Tavily credit/usage exhaustion.
+- Tavily 429 does not trigger Linkup fallback.
+- `in_flight_update` messages are 1-280 trimmed chars and progress percent must be integer 0-100.
+- `edit_file` requires unique old text or explicit occurrence.
+- `write_file` create mode fails if the file exists.
 
-Business rules and validation:
-- Thinking-only assistant content is intentionally not surfaced as user answer text.
-- `edit_file` rejects ambiguous replacements unless `occurrence` provided.
-- `write_file` supports optimistic precondition (`expectedSha256`) to reduce lost update risk.
-- `read_file` enforces UTF-8 decoding with explicit encoding error path.
+Domain logic is partially protected from infrastructure leakage by module boundaries. For example, Gateway does not inspect pi-agent-core message internals, AgentWorker does not know config file paths, and MessageBus does not know Telegram APIs. Some leakage remains: `runCliTurn` naming is CLI-specific even though Telegram uses it, and image parts are degraded to text placeholders.
 
-Workflow orchestration logic:
-- Gateway orchestrates session bootstrap and user loop; worker orchestrates message consumption and publishing; agent orchestrates runtime loop and history management.
-
-Domain isolation from infrastructure:
-- Domain-level envelope/message contracts are separated from CLI rendering details.
-- Tool details objects abstract execution metadata from direct UI formatting.
-
-Consistency boundaries and transaction scoping:
-- Each `runCliTurn` is the principal business transaction unit.
-- Persistence append is eventual and decoupled from immediate user response.
+Consistency boundaries are local. A single bus publish synchronously validates and mutates queues before subscribers run. A single agent turn is serialized within one Agent instance. Persistence append and runtime context replacement are not one atomic transaction across filesystem and memory, but compaction is ordered to persist before dropping.
 
 ## 6. Data Architecture
 
-Database technology:
-- No RDBMS/NoSQL database in current version.
-- Durable storage uses newline-delimited JSON file (`session.jsonl`) in workspace persistence directory.
+There is no database technology in the current implementation. Durable data uses local JSON and JSONL files. This is justified by the local-first runtime, low concurrency, and human-editable configuration needs.
 
 Schema structure:
-- `PersistedMessageRecord` schema v1:
-  - `schemaVersion: 1`
-  - `sessionId: string`
-  - `persistedAt: number`
-  - `message: AgentMessage`
+- `config.json`: JSON matching `AppConfig` with `schemaVersion`, `ingress`, `agent`, `tools`, and `eventInspection`.
+- `session.jsonl`: one JSON object per line matching `PersistedMessageRecord`.
+- `AGENTS.md`, `SOUL.md`, `USER.md`: Markdown prompt/context files.
+- `history.md`: reserved for transcript persistence but not actively written by current code.
+- `skills/*/SKILL.md`: Markdown with YAML frontmatter.
 
-Partitioning/indexing strategy:
-- Physical partitioning by session path (`~/.mahabot/<session>/workspace/persistence/session.jsonl`).
-- No index files; sequential append/read scan.
+Indexing and partitioning:
+- No indexes exist.
+- Persistence is partitioned by session directory and also records `sessionId` per line.
+- At read time, records for unexpected sessions are skipped defensively.
+- MessageBus partitions ingress in memory by `sessionId`.
 
 Migration strategy:
-- Schema version is explicit per record; unknown versions are skipped on read.
-- **Inferred:** future migrations can be additive by introducing new `schemaVersion` handling branch.
+- Config has `schemaVersion: 1`, but no migration runner exists.
+- Validation rejects known legacy/removed fields rather than migrating them.
+- JSONL records require `schemaVersion: 1`; unsupported records are skipped.
+- v2 should add explicit config migration if schema evolution becomes user-facing.
 
 Backward compatibility rules:
-- Store tolerates malformed trailing line and skips invalid or mismatched-session records.
-- Config layer rejects removed legacy fields rather than silently mapping them.
+- Provider model config now requires `models: [{ name, params? }]`; legacy provider-level `model` is not accepted.
+- Removed config keys fail fast with actionable errors.
+- Event inspection thinking uses `eventInspection.thinking`, not removed `agent.runtimeStatus`.
+- Telegram docs preserve `allowedChatIds` field name but define user-id semantics.
 
-Data lifecycle management:
-- Startup restore reads tail window only (bounded by configured count and turn alignment).
-- Runtime compaction trims in-memory message history based on token watermarks.
-- Full historical records remain in JSONL after compaction (compaction is memory-only after persistence).
+Data lifecycle:
+- Config/templates are created if missing during session bootstrap.
+- Prompt scaffold files `SOUL.md` and `USER.md` are recreated if missing during context assembly.
+- `session.jsonl` grows append-only; no archival, pruning, or deduplication exists.
+- In-memory context is compacted, but persisted JSONL is not compacted.
 
-Archival and retention:
-- **Code-verified:** no retention pruning or archive rollover policy.
-- **Inferred operational policy needed for v2:** periodic compaction/rotation of large `session.jsonl` files.
-
-Caching layers and invalidation:
-- In-memory caches are implicit: bus queues, runtime message state, skill scan result per prompt assembly call.
-- No cross-process cache coherence concerns in current design.
-
-Read/write separation:
-- Append-only writes and full-file reads; no read replicas.
+Caching:
+- No explicit cache layer exists.
+- ConfigManager stores a validated config clone in memory.
+- ToolRegistry stores ordered tools in memory.
+- Skills are scanned during prompt assembly, not cached across runtime rebuilds.
+- MessageBus queues are transient in-memory state.
 
 Consistency model:
-- Hybrid:
-  - Strong in-memory consistency within process event loop for active session.
-  - Eventual durability to JSONL based on persist timings.
+- Strong in-process consistency for current JS event-loop operations.
+- Eventual/best-effort consistency for persistence because append failures do not abort turns.
+- No cross-process consistency is provided.
 
 ## 7. API and Contract Design
 
-Public API surface (user-facing):
-- CLI commands:
-  - `mahabot cli`
-  - `mahabot help`
-- In-session commands:
-  - `/help`
-  - `/clear`
-  - `/exit` (and aliases `exit`, `quit`, `:q`)
+Public CLI API:
+- `mahabot cli`: starts CLI runtime.
+- `mahabot telegram`: starts Telegram runtime.
+- `mahabot help`, `-h`, `--help`: prints usage.
 
-Internal bus contract:
-- Envelope fields: `id, sessionId, ts, direction, source, kind, priority, payload, renderHints?, meta?`
-- `direction` enum: `user_to_agent | agent_to_user`
-- `kind` enum:
-  - user: `ui.user_message`
-  - agent: `agent.assistant_message`, `agent.runtime.event`, `agent.runtime.token_usage`, `agent.runtime.inflight_update`, `agent.runtime.thinking`
+CLI in-session commands:
+- `/help`: show help.
+- `/clear`: rebuild conversation runtime and reload system prompt.
+- `/exit`, `exit`, `quit`, `:q`: stop CLI mode.
 
-Tool contract model:
-- Each tool has typed parameters schema (`@mariozechner/pi-ai Type.*`), `content` blocks for model consumption, and structured `details` for app/test logic.
+Telegram public behavior:
+- Private text messages from whitelisted users are accepted.
+- Non-private chats receive a private-text-only notice.
+- Non-whitelisted users receive access denied.
+- Other chats after activation receive active-chat rejection.
+- Assistant output and runtime status are forwarded as Telegram text messages.
 
-Key internal tool/event schemas:
-- `in_flight_update` payload includes `message`, optional `nextStep/progressPercent/stage/dedupeKey`, and published runtime text format: `message | next: ... | N%`.
-- `web_search` details include provider attempts, provider used, fallback reason, normalized results (always `url` + `description`), and typed error codes.
-- Filesystem tools emit typed `errorCode` values from shared `FsErrorCode` taxonomy.
+Internal MessageBus API:
+- `publish(envelope)`: validates and routes envelope.
+- `getUserMsgFromBus(sessionId, signal?)`: resolves next user message for one session.
+- `subscribe(handler, filter?)`: registers subscriber and returns unsubscribe function.
+- `getQueues()`: returns diagnostic snapshots.
+
+Envelope schema:
+- Shared fields: `id`, `sessionId`, `ts`, `direction`, `source`, `kind`, `priority`, `payload`, optional `renderHints`, optional `meta`.
+- Directions: `user_to_agent`, `agent_to_user`.
+- Priorities: `high`, `normal`, `low`.
+- User kind: `ui.user_message`.
+- Agent kinds: `agent.assistant_message`, `agent.runtime.event`, `agent.runtime.token_usage`, `agent.runtime.inflight_update`, `agent.runtime.thinking`.
+
+Tool API contracts are upstream `AgentTool` objects with `name`, `label`, `description`, `parameters`, and async `execute(toolCallId, params, signal?)`. Tool results use text content plus structured `details`. Filesystem tools share `ok`, `errorCode`, and `resolvedPath` patterns.
+
+Config API is file-based JSON. Validation is the compatibility enforcement mechanism. There is no HTTP API and no API version negotiation beyond config `schemaVersion`.
 
 Error model:
-- Tool errors are text + structured details with `ok: false` and `errorCode`.
-- Worker-level runtime failure returns assistant text prefix `[error]`.
-- Config validation throws explicit errors with field path hints.
+- Startup/config errors throw with actionable text.
+- Tool errors usually return structured tool results instead of throwing, except intentionally failing showcase tools or unexpected runtime errors.
+- Worker turn errors become assistant messages.
+- Bus validation errors throw synchronously.
 
-Versioning policy:
-- No explicit API version header; internal schema versioning appears in config (`schemaVersion`) and JSONL records.
-
-Deprecation policy:
-- Implemented as strict rejection for removed config fields (e.g., `agent.runtimeStatus`, deprecated model params).
-
-AuthN/AuthZ integration:
-- API keys loaded via env vars configured per provider/search tool.
-- No user authentication/authorization layer for local CLI actor.
+Authentication and authorization:
+- CLI has no authentication.
+- Telegram authenticates implicitly through Telegram identity and authorizes through configured user-id whitelist.
+- LLM/search providers authenticate with API keys from environment variables.
+- Filesystem/shell tools authorize by workspace path policy, not by user roles.
 
 Rate limiting:
-- No in-app rate limiter; external API responses (e.g., Tavily 429/432/433) are surfaced and mapped.
+- No app-level rate limiting exists.
+- External providers may rate limit.
+- `web_search` limits result count and provider fallback, but not call frequency.
 
-Internal events naming strategy:
-- Dot-scoped kind namespace (`agent.runtime.*`, `agent.assistant_message`, `ui.user_message`).
-
-Schema evolution rules (inferred):
-- Prefer additive envelope/meta fields while preserving existing required fields and kind semantics.
-- Maintain compatibility by tolerant readers and strict validators at publish boundaries.
-
-Consumer isolation guarantees:
-- Bus subscriber isolation via try/catch ensures one faulty consumer does not break others.
+Internal event contracts:
+- Topic naming is represented by `kind` strings rather than external topics.
+- Schema evolution should add new `MessageKind` variants and validator coverage together.
+- Consumers are isolated by subscription filters and handler try/catch, but not by process boundary.
 
 ## 8. Security Architecture
 
-Authentication mechanism:
-- External provider auth via API keys from environment variables:
-  - LLM provider keys from `agent.llmProviders[].apiKeyEnvVar`
-  - Search provider keys from `tools.webSearch.*ApiKeyEnvVar`
+Authentication:
+- CLI mode relies on local machine access.
+- Telegram mode relies on Telegram sender identity plus configured whitelist.
+- Provider APIs rely on environment-variable API keys.
 
 Token/session model:
-- No user login session tokens.
-- Session identity is local workspace session id used for isolation of runtime state and persistence paths.
+- There is no user session token inside mahabot.
+- Runtime sessions are logical ids used for routing and persistence.
+- Telegram bot token is read from the env var named by `ingress.telegram.botTokenEnvVar`.
+- LLM provider keys are read from env vars named by provider config.
 
 Authorization model:
-- Capability-based authorization by tool registration + per-tool validation.
-- Filesystem/shell authorization enforced by workspace boundary policy when `restrictToWorkspace=true`.
-
-Permission granularity:
-- Path-level checks in filesystem and bash tools.
-- `read_file` allows additional root for builtin skills to support skill workflow discovery.
-
-Role hierarchy:
-- **Code-verified:** none (single local actor).
+- Telegram user-id whitelist is the only human authorization gate.
+- Tool execution authorization is policy-based: workspace restriction, bash blacklist, command risk filters, path canonicalization, and extra allowed root for builtin skills.
+- There are no roles, role hierarchy, tenant permissions, or per-tool user permissions.
 
 Multi-tenant isolation:
-- Session-id scoped queue partitioning and per-session persistence files.
-- **Inferred limitation:** isolation is cooperative in-process, not OS/container hardened.
+- Not implemented as a hosted concept.
+- Session ids isolate bus consumption and persistence directories in a single-user local runtime.
+- Telegram V1 deliberately allows only one active chat per process run.
 
-Encryption in transit/at rest:
-- Transit encryption delegated to HTTPS endpoints (LLM/search provider URLs).
-- At rest encryption is not implemented for local files.
-
-Key management:
-- Keys are sourced from environment at runtime; no secrets persisted by config manager logic.
+Encryption:
+- In transit to Telegram, LLM providers, Tavily, and Linkup depends on HTTPS used by those libraries/APIs.
+- At rest, config, prompts, and JSONL are plain local files. No app-level encryption exists.
+- Key management is external to the app through environment variables.
 
 Audit logging:
-- No formal audit trail subsystem; available observability is via runtime status messages and optional debug logs.
+- No formal audit log exists.
+- `session.jsonl` persists agent messages, not bus envelopes, tool policy decisions, or Telegram identity metadata.
+- Warnings/errors go to console.
 
 Threat model and mitigations:
-- Prompt/content injection risk from tool outputs is acknowledged in system prompt templates, not programmatically enforced.
-- Destructive shell command risk reduced by blacklist and high-risk pattern blocking.
-- Workspace exfiltration risk reduced by path-policy checks in tools and shell path token analysis.
-- Config schema hardening prevents unsupported legacy settings from silently changing behavior.
+- Prompt injection through user text or web/tool output: partially mitigated by system prompt rules, not technically eliminated.
+- Unauthorized Telegram access: mitigated by user-id whitelist and private-text-only support.
+- Accidental filesystem damage: mitigated by workspace restriction, path canonicalization, atomic writes, SHA preconditions, create mode, and exact edit matching.
+- Destructive shell commands: mitigated by command blacklist, git destructive blacklist, high-risk pattern rejection, workspace working-dir checks, timeout, and output truncation.
+- Secret leakage: mitigated by env-var indirection, but prompts/tools could still expose env-derived behavior if future tools read env unsafely.
+- Denial of service: unbounded bus queues and JSONL growth are current risks.
 
 Attack surface:
-- Shell execution (`bash`) is highest-risk surface; mitigated by deny rules, timeout, and workspace checks.
-- Filesystem mutation tools (`write_file`, `edit_file`) rely on explicit params and optional hash preconditions.
-- Network egress via `web_search` and upstream LLM runtime.
+- CLI stdin.
+- Telegram bot messages.
+- Config files and prompt files edited by user.
+- Tool parameter execution.
+- External search result content.
+- LLM provider output/tool-call requests.
+- Local filesystem paths and symlinks.
 
 ## 9. Non-Functional Design
 
-Performance targets (code-derived practical envelope):
-- Shell command timeout fixed at 120,000 ms.
-- `read_file` default max read 8KB, bounded 256..65536 bytes.
-- `bash` captured stdout/stderr each bounded to 8KB with truncation indicators.
-- `glob` default max results 200 (schema up to 5000).
-- `grep` defaults are effectively high (`maxMatches` 200, `maxFiles` 5000) with truncation tracking.
+Performance targets are not explicitly defined in code. The practical expectation is interactive personal-agent latency, dominated by model and tool calls. Internal bus and mapping operations should be negligible relative to LLM latency.
 
-Scalability strategy:
-- Session queue partitioning enables independent per-session FIFO behavior.
-- Microtask dispatch avoids synchronous publish-path blocking by subscribers.
+Scalability strategy is vertical and local. The code supports per-session maps but gateway policy is single active session per process mode. v2 scaling would need queue limits, worker pools, durable queueing, isolated runtime per session, and memory controls.
 
-Load behavior and backpressure:
-- No explicit queue backpressure; unbounded in-memory arrays can grow under sustained load.
-- Tool-level result bounding limits single-call payload size.
+Load behavior:
+- Bus queues are unbounded arrays.
+- Subscribers run in microtasks, which prevents inline blocking but can still accumulate work under heavy publish rates.
+- Bash output is byte-limited.
+- Read/search/list/glob tools bound output and traversal by maxBytes/maxResults/maxFiles/maxDepth/maxEntries.
+- Web search result count is capped at 10.
 
-Resilience mechanisms:
-- Error isolation in bus dispatch and event inspection.
-- Graceful degradation when persistence or status publication fails.
+Backpressure:
+- No central backpressure exists.
+- Tool-level bounds are the main local backpressure mechanism.
+- Agent turn serialization prevents concurrent turns from the same Agent instance, but incoming bus messages can still queue.
 
-Availability targets:
-- **Inferred:** best-effort local availability; no HA deployment semantics.
+Resilience:
+- Defensive catch/log patterns are common around optional observers and egress.
+- Abort signals are used for worker waiting and bash command execution.
+- Persistence failure degrades without killing the process.
 
-Observability architecture:
-- Runtime status events (`agent.runtime.event/token_usage/inflight_update/thinking`) as first-class telemetry channel.
-- Optional bash debug env (`MAHABOT_BASH_TOOL_DEBUG`) for detailed shell tool diagnostics.
+Availability target:
+- Code-verified: no SLO/SLA.
+- Inferred: best-effort local availability while process and dependencies are running.
 
-Logging format:
-- Predominantly plain text warnings/errors with module prefixes.
+Observability:
+- Runtime status can be surfaced through MessageBus and egress channels.
+- Event inspection is configurable per event kind.
+- Token usage can be emitted on turn end when enabled.
+- Thinking can be emitted on thinking end when enabled.
+- Tool inspection formatters compress tool I/O to short snippets.
 
-Metrics/tracing model:
-- No dedicated metrics backend.
-- Token usage snapshots embedded into runtime status via event inspection.
+Logging:
+- Uses console warn/error/debug/info abstractions.
+- User-visible status uses bus envelopes, not raw logger output.
+- Telegram explicitly does not forward debug logger output.
 
-Alerting model:
-- No automatic alerting pipeline.
+Metrics/tracing:
+- No metrics backend or distributed tracing exists.
+- Token usage status is the closest metric-like event.
+- Bus queue snapshots are available for tests/diagnostics.
 
-Known bottlenecks/scaling limits:
-- Single process/event loop.
-- Unbounded in-memory queue growth.
-- Full-file read for JSONL restore.
-- External API latency dominates turn duration.
+Bottlenecks:
+- LLM provider latency and rate limits.
+- Shell subprocess timeout and output truncation.
+- Recursive grep/glob/list operations on large workspaces.
+- Append-only `session.jsonl` read-all startup restore.
+- Telegram send throughput and provider limits.
 
 ## 10. Configuration and Environment Design
 
-Environment separation:
-- Session bootstrap creates isolated workspace under `~/.mahabot/<sanitizedSessionId>/`.
-- Per-session config file at `<sessionRoot>/config.json`.
+Environment separation is session-directory based, not deployment-environment based. CLI and Telegram use stable session ids and separate `~/.mahabot/<session>/` roots. There are no explicit dev/staging/prod profiles.
 
 Configuration injection:
-- Startup `dotenv.config()` loads env vars.
-- Config manager loads and validates JSON config, then runtime resolves provider/model and keys.
+- `.env` is loaded at process start by `dotenv`.
+- Config file is loaded from the session root selected by bootstrap.
+- API keys are read from environment variables named by config.
+- Template root can be overridden by `MAHABOT_TEMPLATE_ROOT`.
 
-Feature-flag style controls:
-- `eventInspection.useEventInspection`
-- `eventInspection.showTokenUsage`
-- `eventInspection.include.*`
-- `eventInspection.thinking.enabled/maxChars`
-- `tools.restrictToWorkspace`
+Feature flags:
+- `ingress.telegram.enabled` gates Telegram mode.
+- `tools.restrictToWorkspace` gates filesystem/bash workspace restrictions.
+- `eventInspection.useEventInspection`, `showTokenUsage`, include flags, and `thinking.enabled` gate runtime status visibility.
+- There is no rollout service or dynamic feature flag backend.
 
 Rollout strategy:
-- Local config file edits plus rerun CLI.
-- `/clear` command rebuilds runtime and reloads prompt/config in active session loop.
+- Current rollout is local config edit plus restart.
+- `/clear` reloads prompt/runtime but not full process environment.
 
-CI/CD structure:
-- Build: `tsc` + template copy script.
-- Test: Node test runner via `tsx --test` across unit tests.
-- No deployment pipeline code in repo.
+CI/CD:
+- Package scripts define build and test.
+- Tests use Node's built-in test runner through `tsx`.
+- No GitHub Actions or deployment pipeline is visible in the repository.
 
 Infrastructure as Code:
 - None.
 
-Blue/green or canary:
-- None.
+Blue/green/canary:
+- None. A future hosted version would need process supervisor, health checks, config migration, and separate runtime deployments.
 
 ## 11. Dependency Graph and Technology Stack
 
-Programming language and runtime:
-- TypeScript (ESM), Node.js >= 20.
+Languages and runtime:
+- TypeScript, target ES2022.
+- Node.js >= 20.
+- ESM package (`"type": "module"`).
 
-Core frameworks/libraries:
-- `@mariozechner/pi-agent-core` for agent runtime and event model.
-- `@mariozechner/pi-ai` for model abstraction and tool schema type builders.
-- `dotenv` for env loading.
-- `yaml` for skill frontmatter parsing (`parseDocument`).
-- `tsx` for dev/test execution.
+Main dependencies:
+- `@mariozechner/pi-agent-core`: agent runtime, message/event/tool contracts, thinking levels.
+- `@mariozechner/pi-ai`: model lookup, model type, schema `Type`.
+- `dotenv`: environment variable loading.
+- `telegraf`: Telegram bot long polling and messaging.
+- `yaml`: YAML frontmatter parsing for skills.
 
-External services:
-- Configured LLM providers (OpenAI category and compatible endpoints supported).
-- Tavily and Linkup search APIs.
-
-Version constraints:
-- Package versions pinned by `package-lock.json`; semver ranges in `package.json`.
+Dev dependencies:
+- `tsx`: execute TypeScript tests/dev commands.
+- `typescript`: compile source.
+- `@types/node`: Node typings.
 
 Internal dependency layering:
-- CLI -> Gateway -> (Config + Context + Bus + Agent + Worker + Renderer)
-- Agent -> Runtime factory + Mapper + Persistence + Inspection + Tools registry
-- Tools -> shared filesystem utilities / network fetch
+- `src/cli.ts` depends on gateway.
+- Gateway depends on config, context, messageBus, agent, worker, tools, ingress/egress adapters.
+- Agent depends on config model factory, runtime factory, tools, mappers, persistence.
+- Runtime factory depends on upstream pi-agent-core and pi-ai.
+- Context depends on config, skills, and tool registry.
+- Tools depend on pi-ai `Type`, shared filesystem helpers, and runtime status types.
+- MessageBus is intentionally low-level and should not depend on gateway/agent/tools.
 
-Layering rules observed:
-- High-level orchestration modules depend on lower-level modules, not vice versa.
-- Tool registry depends on tool implementations; tools do not depend on gateway.
+Layering rules for v2:
+- Keep MessageBus independent of ingress/egress implementations.
+- Keep Gateway as composition root; avoid putting runtime construction in adapters.
+- Keep tools self-contained with explicit runtime context.
+- Keep config validation before runtime construction.
+- Preserve tests as executable contracts when changing bus, persistence, Telegram, and filesystem tools.
 
-Upgrade strategy (inferred):
-- Maintain compatibility via strict config validation and test suite coverage before dependency bumps.
+Version constraints:
+- Node engine is `>=20.0.0`.
+- Package dependencies use caret versions. v2 upgrades should run full test suite because upstream agent/model contracts may change.
 
 Breaking change policy:
-- Current code practices explicit rejection of removed config fields, signaling hard breaks early.
+- Config breaking changes should be either rejected clearly as current code does or migrated explicitly.
+- MessageBus kind/payload changes require validator and tests together.
+- Tool schema changes are prompt/runtime contract changes and should be treated as breaking for existing agent behavior.
 
 ## 12. Failure Analysis
 
-Critical component: MessageBus
-- SPOF risk: single in-memory instance; process crash loses queued messages.
-- Cascade risk: invalid publish throws to caller; if uncaught in caller path it can abort local flow.
-- Partial degradation: subscriber failures are isolated, so rendering failure does not block queueing.
-- Recovery: restart process; no queue replay.
+CLI entrypoint single point of failure: if command parsing or Gateway construction fails, no runtime starts. Recovery is fixing command/config and rerunning. RTO is manual restart time; RPO is unaffected except unsaved runtime messages.
 
-Critical component: Agent runtime wrapper
-- SPOF risk: single runtime instance per session; corruption of state can stall turn execution.
-- Cascade risk: runtime/provider errors bubble into worker error messages but process continues.
-- Partial degradation: event inspection can fail independently without stopping turns.
-- Recovery: `/clear` rebuild or process restart.
+Gateway single point of failure: it is the composition root. Bad config, missing templates, prompt read failures, or runtime construction failures stop startup. Recovery is fixing filesystem/config/env. RTO is local fix plus restart. RPO depends on last successful `session.jsonl` append.
 
-Critical component: Persistence subsystem
-- SPOF risk: filesystem write/read failures degrade durability.
-- Cascade risk: append failure does not stop responding but risks history gaps.
-- Partial degradation: startup restore can fail and still run empty-history mode.
-- Recovery: restore file permissions/paths; keep app running.
+MessageBus risks: all queues are memory-only and unbounded. Process crash loses queued bus envelopes. A flood can grow arrays and memory. Subscriber failures do not cascade, but validation failures in producers can interrupt the producing path. Disaster recovery is process restart; no queued message recovery exists.
 
-Critical component: Bash tool
-- SPOF risk: abusive or pathological commands can consume runtime budget.
-- Cascade risk: subprocess hangs mitigated by timeout + SIGTERM/SIGKILL.
-- Partial degradation: blocked commands return structured blocked result instead of executing.
-- Recovery: subsequent calls continue; no global shell state retained beyond working directory path.
+AgentWorker risks: one worker loop per session means a stuck agent turn blocks later messages for that session. Abort on stop helps shutdown, but there is no per-turn timeout in worker. Recovery is abort/restart. User-visible degradation is delayed or `[error]` responses.
 
-Critical component: Web search tool
-- SPOF risk: external API downtime/credit exhaustion blocks search feature only.
-- Cascade risk: no retries storm; fallback only on specific Tavily credit conditions.
-- Partial degradation: explicit error details still returned to model/user.
-- Recovery: restore API keys/credits or provider availability.
+Agent/pi-agent-core risks: upstream model/runtime failure blocks core functionality. Missing assistant message throws. Tool-call loops and provider latency dominate availability. Recovery is provider config fix, credential fix, or restart.
 
-Disaster recovery model:
-- Manual recovery via process restart, workspace inspection, and config/env fixes.
-- No automated failover orchestration.
+Persistence risks: `session.jsonl` append failure loses durable history for those messages. Read-all startup can slow down as file grows. Malformed records are skipped; malformed trailing line is tolerated. Backup is whatever local filesystem backup the user has. No restore command exists beyond reading JSONL on startup.
 
-Backup and restore:
-- Primary recoverable artifact is `session.jsonl` and workspace files.
-- No automated backup process in code.
+Config/template risks: missing template files break bootstrap unless another candidate root contains them. User-edited invalid config fails fast. Backup is manual/local. v2 should avoid storing real default personal Telegram ids in shipped templates if broader distribution is intended.
 
-RTO and RPO:
-- **Inferred RTO:** minutes (manual restart and rerun `mahabot cli`).
-- **Inferred RPO:** up to last successful `appendMessages`; in-memory turns not yet flushed may be lost on crash.
+Context/prompt risks: prompt files can become stale, missing, or maliciously edited. Required `AGENTS.md` failure stops startup. Optional prompt files recover from templates. Wrong prompt content can cause agent misbehavior without code errors.
+
+Telegram risks: bot token missing, Telegram outage, polling failure, send failure, non-private messages, or unauthorized users. Current process logs middleware errors and send failures. One active chat policy prevents multi-chat contention but limits availability.
+
+Tools risks:
+- Bash is highest risk for destructive or hanging commands; mitigations are blacklist, workspace checks, timeout, output truncation, and abort.
+- Filesystem tools risk unintended writes; mitigations are workspace policy, atomic writes, create/append modes, SHA preconditions, exact matching.
+- Web search risks provider outage/credit exhaustion; fallback exists only for Tavily credit exhaustion.
+- Event/in-flight status risks chat/terminal noise; config can disable inspection, but Telegram forwards all status envelopes for the session.
+
+Disaster recovery:
+- There is no automated DR.
+- Manual recovery means restart process, fix config/env/files, and rely on existing `session.jsonl`.
+- RTO: minutes for local restart and config fixes.
+- RPO: last successfully appended messages; queued bus messages and current in-flight turn may be lost on crash.
 
 ## 13. Versioning and Evolution Strategy
 
-Semantic versioning policy:
-- Package declares `0.1.0`; practical policy is pre-1.0 evolving API with conservative internal validation.
+Semantic versioning is not formally enforced beyond `package.json` version `0.1.0`. For v2, treat public CLI commands, config schema, MessageBus envelope schema, tool schemas, and JSONL records as versioned contracts.
 
-API evolution strategy:
-- Keep bus kind/direction contract stable.
-- Extend payloads with optional fields instead of mutating required ones.
-- Preserve tool names and base parameter semantics where possible.
+API evolution:
+- Add new CLI commands without changing existing `cli`, `telegram`, and `help`.
+- Add new MessageBus kinds by updating type union, validator, renderers/relays, and tests.
+- Add new tools only through `ToolAssembly` and `ToolRegistry` so prompt rules and uniqueness are preserved.
+- Rename `runCliTurn` only with compatibility care because Telegram currently uses it.
 
-Database/persistence migration governance:
-- JSONL records include `schemaVersion`; readers should remain tolerant of older/newer records.
-- Introduce migration adapters when bumping record schema.
+Database/file migration governance:
+- Config schema should gain explicit migration when `schemaVersion` changes.
+- JSONL record schema should support forward-compatible skipping or migration.
+- Append-only history may need compaction/archive tooling before long-running usage.
 
 Backward compatibility validation:
-- Unit tests already enforce key behaviors (message bus FIFO, persistence alignment, tool error modes, config slimming).
-- v2 should add compatibility tests for existing envelope and tool detail contracts.
+- Maintain tests for config slimming, Telegram ingress/egress/runtime config, MessageBus FIFO/waiters, persistence window alignment, message mapping, and tools.
+- Add contract tests whenever modifying envelope or tool result details.
 
 Contract testing model:
-- Existing tests are contract-style for tools and orchestration modules.
-- v2 should formalize snapshot or schema assertions for `details` payloads and runtime status lines.
+- Current Node tests already encode important contracts.
+- v2 should add integration tests for full CLI bus-worker-agent path with mocked model runtime if upstream runtime can be stubbed.
+- Telegram should remain adapter-tested without hitting real Telegram API.
 
 Deprecation timelines:
-- Current pattern is immediate rejection of removed config keys.
-- **Inferred v2 recommendation:** one release cycle warning phase before hard reject for user-facing config fields.
+- None currently documented.
+- Future deprecations should fail with explicit messages for at least one minor cycle if this becomes distributed to users.
 
 Compatibility enforcement:
-- Config manager is strict gatekeeper.
-- Tool registry duplicate checks prevent accidental contract collisions.
+- ConfigManager is the enforcement point for config compatibility.
+- kindRegistry is the enforcement point for bus compatibility.
+- Tool parameter schemas and tests are enforcement points for tool compatibility.
+- TypeScript strict compilation catches many internal contract breaks.
 
 ## 14. Formal Consistency and Invariants
 
 System-wide invariants:
-- Every published envelope must pass structural validation and direction-kind compatibility checks.
-- Worker consumes only messages for its configured `sessionId`.
-- Agent turn execution is serialized by `runExclusive` queue.
+- Exactly one gateway mode is active per process invocation: CLI or Telegram.
+- Runtime construction must occur after config load/validation.
+- Tool registry names must be globally unique.
+- Add-on tool registration is disabled in this phase.
+- User-visible final output must come from assistant text extraction, not thinking blocks.
 
 Data invariants:
-- Persisted JSONL records for this session must have `schemaVersion=1` and matching `sessionId` to be loaded.
-- Compacted in-memory history must end on an assistant turn boundary when produced by alignment logic.
+- Config root must be a JSON object with numeric `schemaVersion`.
+- Enabled provider/model pairs for active and default config must exist.
+- `compactLowWatermarkTokens < compactHighWatermarkTokens`.
+- Telegram allowed ids normalize to non-empty strings.
+- JSONL records must have `schemaVersion: 1`, matching `sessionId`, finite `persistedAt`, and object message.
+- Bus envelopes must have valid id/session/source/priority/direction/kind/payload.
 
 Transaction invariants:
-- A single bus user envelope maps to at most one worker turn execution.
-- Compaction must not drop unpersisted messages (persist-before-drop rule in coordinator).
+- Bus `publish` validates before routing.
+- Per-session user messages are consumed FIFO.
+- A waiting worker receives exactly one next message for its session.
+- Agent turns are serialized per Agent instance.
+- Context compaction must persist pending messages before replacing runtime messages.
+- Compacted/restored context windows must align to completed assistant turns.
 
 Security invariants:
-- In restricted mode, filesystem and bash operations must remain within allowed workspace roots unless explicitly allowed (`read_file` builtin skills root).
-- Blacklisted/high-risk bash command patterns must be blocked before execution.
-- Provider credentials must be present in env before model use when required.
+- Non-whitelisted Telegram users must not publish agent-executed messages.
+- Telegram V1 must not execute messages from a different chat after activation.
+- Filesystem tools must reject outside-workspace paths when restricted, except `read_file` may read builtin skill files.
+- Bash must reject configured destructive and high-risk command patterns.
+- Provider secrets are obtained from env vars, not from committed config secret values.
 
 Operational invariants:
-- Subscriber exceptions must not abort message dispatch loop.
-- Event inspection exceptions must not break agent runtime callback path.
-- CLI renderer must remain best-effort and side-effect-only (output writing).
+- Worker stop must abort pending bus waiters and exit the loop.
+- Event inspection must not throw into agent runtime callbacks.
+- Subscriber failure must not prevent other subscribers from receiving future messages.
+- Telegram send failures must not crash the process.
+- Persistence restore/append failures must degrade gracefully and log.
 
-Verification/enforcement mechanisms:
-- Runtime checks in `kindRegistry`, `configManager`, tool validators, and path policy resolvers.
-- Unit tests validating critical invariants across bus, persistence, tools, skills parsing, and config behavior.
+Verification approach:
+- Keep `npm test` green as the minimum executable consistency check.
+- Use targeted tests around bus, persistence, gateway adapters, and tool policy before changing those modules.
+- When adding runtime modes, preserve the existing normalized bus contract so AgentWorker/Agent behavior remains reusable.
+- When adding persistence migrations, test malformed, mixed-session, old-version, and trailing-partial-line cases.
 
----
-
-## Appendix: Explicit Inferred Items for v2 Planning
-
-The following are intentionally marked inferred because code does not fully enforce them yet:
-- Formal SLO/SLA targets, RTO/RPO numbers, and retention windows.
-- Multi-region and distributed deployment strategy.
-- Automated backup, alerting, and circuit-breaker controls.
-- Explicit deprecation schedule policy beyond current hard-reject behavior.
-
-These should be resolved into concrete engineering decisions during v2 design kickoff.
+For a coding agent reading this project, the practical path is: start with `src/gateway/manager.ts` for runtime wiring, then `src/messageBus/*` for transport semantics, then `src/agent/worker/agentWorker.ts` and `src/agent/agent.ts` for turn execution, then `src/config/*` and `src/context/*` for startup/prompt behavior, and finally the specific adapter/tool/persistence module relevant to the requested change.
