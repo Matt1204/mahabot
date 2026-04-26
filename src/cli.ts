@@ -42,6 +42,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "telegram") {
+    const manager = new MahabotGatewayManager();
+    await manager.runInTelegramMode();
+    return;
+  }
+
   throw new Error(`Unknown command: ${command}`);
 }
 
@@ -49,6 +55,7 @@ function printHelp(): void {
   console.log([
     "Usage:",
     "  mahabot cli",
+    "  mahabot telegram",
     "  mahabot help",
     "",
     "Options:",
@@ -56,6 +63,7 @@ function printHelp(): void {
     "",
     "Examples:",
     "  mahabot cli",
+    "  mahabot telegram",
   ].join("\n"));
 }
 

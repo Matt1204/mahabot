@@ -1,24 +1,39 @@
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
 import readline from "node:readline/promises";
+import { Telegraf } from "telegraf";
 
 import { Agent, EventInspection } from "../agent/index.js";
-import type { InspectionSink } from "../agent/index.js";
+import { AgentWorker } from "../agent/worker/agentWorker.js";
+import type { AgentRuntimeStatusPublisher } from "../agent/runtimeStatus/types.js";
 import { assembleTools, ToolRegistry } from "../agent/tools/index.js";
-import { createCliProgressUpdateSink } from "./progress/cliProgressSink.js";
 import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
+import { createCliRenderer } from "./egress/cliRenderer.js";
+import { createTelegramEgressRelay } from "./egress/telegramEgressAdapter.js";
+import { publishCliUserMessage } from "./ingress/cliIngressAdapter.js";
+import { evaluateTelegramIngress } from "./ingress/telegramAccessPolicy.js";
+import { publishTelegramUserMessage } from "./ingress/telegramIngressAdapter.js";
+import { resolveTelegramRuntimeConfig } from "./ingress/telegramRuntimeConfig.js";
+import { InMemoryMessageBus, createBusMessageId, type MessageBus } from "../messageBus/index.js";
 
-const DEMO_SESSION_ID = "cli-stable-session";
+const CLI_WORKSPACE_SESSION_ID = "cli-stable-session";
+const TELEGRAM_WORKSPACE_SESSION_ID = "telegram-stable-session";
+
+interface SessionRuntime {
+  agent: Agent;
+  worker: AgentWorker;
+}
+
+interface WorkerBinding {
+  channel: "cli" | "telegram";
+  chatId: string;
+  userId: string;
+}
+
 /**
- * Future gateway/external manager entrypoint.
- *
- * Current implementation:
- * - `mahabot cli` interactive mode
- * Future scope:
- * - message bus ingestion
- * - telegram/webhook ingress
- * - external transport orchestration
+ * Gateway orchestrates process lifecycle only.
+ * It no longer handles turn execution directly; AgentWorker consumes MessageBus ingress.
  */
 export class MahabotGatewayManager {
   private readonly contextManager: ContextManager;
@@ -35,7 +50,7 @@ export class MahabotGatewayManager {
   }
 
   async runInCliMode(): Promise<void> {
-    const bootstrap = await this.configManager.initializeSessionWorkspace(DEMO_SESSION_ID);
+    const bootstrap = await this.configManager.initializeSessionWorkspace(CLI_WORKSPACE_SESSION_ID);
 
     if (bootstrap.isFirstConfigCreated) {
       this.io.output.write(
@@ -51,13 +66,28 @@ export class MahabotGatewayManager {
 
     await this.configManager.load();
 
-    let agent = await this.buildAgentForSession(
+    const bus = new InMemoryMessageBus({
+      warn: console.warn,
+    });
+    const stopRenderer = createCliRenderer({
+      bus,
+      sessionId: bootstrap.workspaceSessionId,
+      output: this.io.output,
+    });
+
+    let runtime = await this.buildSessionRuntime(
       bootstrap.workspaceSessionId,
       bootstrap.sessionRoot,
       bootstrap.workspaceRoot,
-      bootstrap.persistenceRoot
+      bootstrap.persistenceRoot,
+      bus,
+      {
+        channel: "cli",
+        chatId: "local",
+        userId: "cli-user",
+      }
     );
-    // await this.printAgentStatusOverview(agent);
+    runtime.worker.start();
 
     const rl = readline.createInterface({
       input: this.io.input,
@@ -69,8 +99,7 @@ export class MahabotGatewayManager {
 
     try {
       while (true) {
-        const userLine = (await rl.question("you> ")).trim();
-
+        const userLine = (await rl.question(getUserPrompt(this.io.output))).trim();
         if (!userLine) {
           continue;
         }
@@ -87,14 +116,22 @@ export class MahabotGatewayManager {
 
         if (userLine === "/clear") {
           try {
-            await agent.stop();
-            agent = await this.buildAgentForSession(
+            await runtime.worker.stop();
+            await runtime.agent.stop();
+
+            runtime = await this.buildSessionRuntime(
               bootstrap.workspaceSessionId,
               bootstrap.sessionRoot,
               bootstrap.workspaceRoot,
-              bootstrap.persistenceRoot
+              bootstrap.persistenceRoot,
+              bus,
+              {
+                channel: "cli",
+                chatId: "local",
+                userId: "cli-user",
+              }
             );
-            // await this.printAgentStatusOverview(agent);
+            runtime.worker.start();
             this.io.output.write("Conversation context cleared and system prompt reloaded.\n\n");
           } catch (error) {
             this.io.output.write(`bot> [error] ${String(error)}\n\n`);
@@ -102,42 +139,260 @@ export class MahabotGatewayManager {
           continue;
         }
 
-        try {
-          const result = await agent.runCliTurn(userLine);
-          this.io.output.write(`bot> ${result.cliMessage}\n\n`);
-        } catch (error) {
-          this.io.output.write(`bot> [error] ${String(error)}\n\n`);
-        }
+        publishCliUserMessage({
+          bus,
+          sessionId: bootstrap.workspaceSessionId,
+          text: userLine,
+        });
       }
     } finally {
       rl.close();
-      await agent.stop();
+      await runtime.worker.stop();
+      await runtime.agent.stop();
+      stopRenderer();
     }
   }
 
-  private async buildAgentForSession(
+  async runInTelegramMode(): Promise<void> {
+    const bootstrap = await this.configManager.initializeSessionWorkspace(TELEGRAM_WORKSPACE_SESSION_ID);
+
+    if (bootstrap.isFirstConfigCreated) {
+      this.io.output.write(
+        [
+          "Created session config for mahabot.",
+          `Config path: ${bootstrap.configPath}`,
+          "Please fill in required values in the config file, then re-run `mahabot telegram`.",
+          "",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const appConfig = await this.configManager.load();
+    const telegramConfig = resolveTelegramRuntimeConfig(appConfig, process.env);
+
+    const bus = new InMemoryMessageBus({
+      warn: console.warn,
+    });
+
+    const bot = new Telegraf(telegramConfig.botToken);
+    let activeChatId: string | null = null;
+    let activeRuntime:
+      | (SessionRuntime & { sessionId: string; chatId: string; stopTelegramRelay: () => void })
+      | null = null;
+    let activationPromise: Promise<void> | null = null;
+
+    let resolveStopSignal: (() => void) | null = null;
+    const stopSignal = new Promise<void>((resolve) => {
+      resolveStopSignal = resolve;
+    });
+
+    let shuttingDown = false;
+    const shutdown = async (reason: string): Promise<void> => {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+
+      try {
+        bot.stop(reason);
+      } catch {
+        // no-op if bot is not currently running
+      }
+
+      if (activeRuntime) {
+        await activeRuntime.worker.stop();
+        await activeRuntime.agent.stop();
+        activeRuntime.stopTelegramRelay();
+        activeRuntime = null;
+      }
+
+      resolveStopSignal?.();
+    };
+
+    const onSigint = () => {
+      void shutdown("SIGINT");
+    };
+    const onSigterm = () => {
+      void shutdown("SIGTERM");
+    };
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+
+    bot.catch((error) => {
+      console.warn(`[telegram] unhandled middleware error: ${String(error)}`);
+    });
+
+    bot.on("message", async (ctx) => {
+      if (shuttingDown) {
+        return;
+      }
+
+      if (!ctx.chat || !ctx.from || !ctx.message || !("text" in ctx.message)) {
+        return;
+      }
+
+      const chatId = String(ctx.chat.id);
+      const userId = String(ctx.from.id);
+      const messageText = ctx.message.text;
+
+      if (ctx.chat.type !== "private") {
+        await ctx.reply("This bot currently supports private text chats only.");
+        return;
+      }
+
+      const decision = evaluateTelegramIngress({
+        activeChatId,
+        chatId,
+        userId,
+        allowedUserIds: telegramConfig.allowedUserIds,
+      });
+
+      if (decision.type === "reject_not_whitelisted") {
+        await ctx.reply("Access denied: your Telegram user ID is not whitelisted.");
+        return;
+      }
+
+      if (decision.type === "reject_other_chat") {
+        await ctx.reply("This bot is already active in another chat for this run.");
+        return;
+      }
+
+      if (decision.type === "accept_activate") {
+        const sessionId = `tg:${chatId}`;
+        activeChatId = chatId;
+
+        activationPromise = (async () => {
+          const runtime = await this.buildSessionRuntime(
+            sessionId,
+            bootstrap.sessionRoot,
+            bootstrap.workspaceRoot,
+            bootstrap.persistenceRoot,
+            bus,
+            {
+              channel: "telegram",
+              chatId,
+              userId,
+            }
+          );
+          if (shuttingDown) {
+            await runtime.agent.stop();
+            return;
+          }
+          runtime.worker.start();
+          const stopTelegramRelay = createTelegramEgressRelay({
+            bus,
+            sessionId,
+            chatId,
+            client: {
+              sendMessage: (targetChatId, text) => bot.telegram.sendMessage(targetChatId, text),
+            },
+            logger: {
+              warn: console.warn,
+            },
+          });
+
+          activeRuntime = {
+            ...runtime,
+            sessionId,
+            chatId,
+            stopTelegramRelay,
+          };
+
+          this.io.output.write(`[telegram] active chat set to ${chatId}, session ${sessionId}\n`);
+        })();
+
+        try {
+          await activationPromise;
+        } catch (error) {
+          activeChatId = null;
+          activeRuntime = null;
+          await ctx.reply(`bot> [error] ${String(error)}`);
+          return;
+        } finally {
+          activationPromise = null;
+        }
+      }
+
+      if (activationPromise) {
+        try {
+          await activationPromise;
+        } catch (error) {
+          await ctx.reply(`bot> [error] ${String(error)}`);
+          return;
+        }
+      }
+
+      if (!activeRuntime) {
+        await ctx.reply("bot> [error] runtime is not ready.");
+        return;
+      }
+
+      publishTelegramUserMessage({
+        bus,
+        sessionId: activeRuntime.sessionId,
+        text: messageText,
+        chatId,
+        userId,
+        username: ctx.from?.username,
+        firstName: ctx.from?.first_name,
+        lastName: ctx.from?.last_name,
+      });
+    });
+
+    this.io.output.write("mahabot Telegram mode starting...\n");
+
+    try {
+      const launchPromise = bot.launch({
+        allowedUpdates: ["message"],
+      });
+
+      this.io.output.write("mahabot Telegram mode started. Press Ctrl+C to stop.\n");
+      await Promise.race([launchPromise, stopSignal]);
+      await stopSignal;
+    } finally {
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+      await shutdown("normal_exit");
+    }
+  }
+
+  private async buildSessionRuntime(
     sessionId: string,
     sessionRoot: string,
     workspaceRoot: string,
-    persistenceRoot: string
-  ): Promise<Agent> {
+    persistenceRoot: string,
+    bus: MessageBus,
+    workerBinding: WorkerBinding
+  ): Promise<SessionRuntime> {
     const appConfig = this.configManager.get();
     const { provider: activeProvider, model: activeModel } = this.configManager.getActiveProviderModel();
 
-    // Progress path (docs/progress_sink_and_inspection_sink.md): `in_flight_update` is wired here only.
-    // - `quotaRef` is shared with Agent (passed below) so Agent.invokeAgentLoop can reset `used` each turn;
-    //   the tool increments `used` on successful sink delivery.
-    // - `progressSink` is independent of EventInspection / AgentEvent; it is not an InspectionSink.
-    const progressUpdateQuotaRef = { used: 0 };
-    const progressSink = createCliProgressUpdateSink(
-      this.io.output,
-      supportsAnsi(this.io.output)
-    );
+    const publishRuntimeStatus: AgentRuntimeStatusPublisher = (status) => {
+      bus.publish({
+        id: createBusMessageId(),
+        sessionId,
+        ts: Date.now(),
+        direction: "agent_to_user",
+        source: status.source ?? "agent_runtime",
+        kind: status.kind,
+        priority: status.priority ?? "normal",
+        payload: {
+          text: status.text,
+          format: "plain",
+          raw: status.raw,
+        },
+        renderHints: status.renderHints,
+        meta: status.meta,
+      });
+    };
 
     const toolRegistry = new ToolRegistry();
     assembleTools(toolRegistry, appConfig, {
       workspaceRoot,
-      progressUpdate: { quotaRef: progressUpdateQuotaRef, sink: progressSink },
+      runtimeStatus: {
+        publish: publishRuntimeStatus,
+      },
     });
 
     const systemPromptAssembly = await this.contextManager.assembleSystemPrompt(
@@ -148,22 +403,12 @@ export class MahabotGatewayManager {
       toolRegistry
     );
 
-    // Inspection path: subscribe to runtime AgentEvent stream via `onAgentEvent` (see Agent constructor).
-    // EventInspection filters by appConfig.eventInspection, renders `[event_name]` lines, and calls
-    // InspectionSink.publish — see eventInspection.ts for microtask deferral.
     const eventInspection = new EventInspection(appConfig.eventInspection, {
-      sinks: [
-        {
-          channel: "cli",
-          sink: createCliInspectionSink(this.io.output),
-        },
-      ],
+      publishStatus: publishRuntimeStatus,
       getContextWatermarks: () => ({
         lowWaterMark: appConfig.agent.compactLowWatermarkTokens,
         highWaterMark: appConfig.agent.compactHighWatermarkTokens,
       }),
-      supportsAnsi: (channel) =>
-        channel === "cli" ? supportsAnsi(this.io.output) : false,
       logger: {
         debug: () => {},
         warn: console.warn,
@@ -171,7 +416,7 @@ export class MahabotGatewayManager {
       },
     });
 
-    return Agent.createFromAppConfig(
+    const agent = Agent.createFromAppConfig(
       {
         appConfig,
         providerName: activeProvider,
@@ -185,7 +430,6 @@ export class MahabotGatewayManager {
           this.configManager.getApiKeyForProviderName(providerName),
       },
       {
-        // CLI prints final assistant text itself; suppress noisy event logs.
         logger: {
           debug: () => {},
           info: () => {},
@@ -193,14 +437,11 @@ export class MahabotGatewayManager {
           error: console.error,
         },
         outboundSink: async () => {
-          // keep outbound in-process for CLI mode
+          // Final assistant output is delivered through MessageBus by AgentWorker.
         },
         onAgentEvent: (event) => {
-          // Forwards pi-agent-core AgentEvent to EventInspection.handleAgentEvent, which immediately
-          // returns after queueMicrotask (heavy work + sink.publish are deferred — see eventInspection.ts).
           eventInspection.handleAgentEvent(event);
         },
-        progressUpdateQuotaRef,
         messagePersistence: {
           enabled: true,
           sessionId,
@@ -211,60 +452,23 @@ export class MahabotGatewayManager {
         },
       }
     );
+
+    const worker = new AgentWorker(bus, agent, {
+      sessionId,
+      channel: workerBinding.channel,
+      chatId: workerBinding.chatId,
+      userId: workerBinding.userId,
+      logger: {
+        warn: console.warn,
+        error: console.error,
+      },
+    });
+
+    return {
+      agent,
+      worker,
+    };
   }
-
-  // private async printAgentStatusOverview(agent: Agent): Promise<void> {
-  //   const overview = await agent.getStartupStatusOverview();
-  //   const historyRoleSummary = `user=${overview.history.loadedByRole.user}, assistant=${overview.history.loadedByRole.assistant}, toolResult=${overview.history.loadedByRole.toolResult}, other=${overview.history.loadedByRole.other}`;
-  //   const thinkingBudgets = overview.agent.thinkingBudgets
-  //     ? JSON.stringify(overview.agent.thinkingBudgets)
-  //     : "(none)";
-  //   const sessionId = overview.agent.sessionId ?? "(none)";
-  //   const maxRetryDelayMs =
-  //     overview.agent.maxRetryDelayMs === undefined ? "(default)" : String(overview.agent.maxRetryDelayMs);
-  //   const historyError = overview.history.error ? ` error=${overview.history.error}` : "";
-
-  //   this.io.output.write(
-  //     [
-  //       "[agent status overview]",
-  //       `model provider=${overview.model.provider} id=${overview.model.id} name=${overview.model.name} api=${overview.model.api}`,
-  //       `model baseUrl=${overview.model.baseUrl}`,
-  //       `model reasoning=${overview.model.reasoning} input=${overview.model.input.join(",")} contextWindow=${overview.model.contextWindow} maxTokens=${overview.model.maxTokens}`,
-  //       `model cost input=${overview.model.cost.input} output=${overview.model.cost.output} cacheRead=${overview.model.cost.cacheRead} cacheWrite=${overview.model.cost.cacheWrite}`,
-  //       `model headersConfigured=${overview.model.headersConfigured} compatConfigured=${overview.model.compatConfigured}`,
-  //       `agent thinkingLevel=${overview.agent.thinkingLevel} transport=${overview.agent.transport} sessionId=${sessionId} maxRetryDelayMs=${maxRetryDelayMs}`,
-  //       `agent thinkingBudgets=${thinkingBudgets} tools=${overview.agent.tools} runtimeMessages=${overview.agent.runtimeMessages} isStreaming=${overview.agent.isStreaming} pendingToolCalls=${overview.agent.pendingToolCalls}`,
-  //       `history restoreStatus=${overview.history.restoreStatus} loadedMessages=${overview.history.loadedMessages} persistedCursor=${overview.history.persistedCursor} runtimeMessages=${overview.history.runtimeMessages}`,
-  //       `history loadedByRole ${historyRoleSummary}${historyError}`,
-  //       "",
-  //     ].join("\n")
-  //   );
-  // }
-}
-
-// Minimal InspectionSink for CLI: one rendered line per publish (prefix already in `event.line`).
-function createCliInspectionSink(output: { write: (chunk: string) => unknown }): InspectionSink {
-  return {
-    publish(event) {
-      output.write(`${event.line}\n`);
-    },
-  };
-}
-
-function supportsAnsi(output: { isTTY?: boolean }): boolean {
-  if (process.env.NO_COLOR !== undefined) {
-    return false;
-  }
-
-  if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0") {
-    return true;
-  }
-
-  if (process.env.TERM === "dumb") {
-    return false;
-  }
-
-  return Boolean(output.isTTY);
 }
 
 function isExitCommand(line: string): boolean {
@@ -285,4 +489,12 @@ function helpText(): string {
     "  /exit  Exit CLI mode",
     "",
   ].join("\n");
+}
+
+function getUserPrompt(output: { write: (chunk: string) => unknown }): string {
+  const supportsAnsi = "isTTY" in output && (output as { isTTY?: boolean }).isTTY === true;
+  if (!supportsAnsi || process.env.NO_COLOR !== undefined || process.env.FORCE_COLOR === "0") {
+    return "you> ";
+  }
+  return "\x1b[1;97myou>\x1b[0m ";
 }

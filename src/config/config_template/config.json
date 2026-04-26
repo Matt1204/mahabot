@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "ingress": {
     "telegram": {
-      "enabled": false,
+      "enabled": true,
       "botTokenEnvVar": "TELEGRAM_BOT_TOKEN",
-      "allowedChatIds": []
+      "allowedChatIds": ["7346503136"]
     }
   },
   "agent": {
@@ -56,6 +56,10 @@
       "tool_execution_start": false,
       "tool_execution_update": false,
       "tool_execution_end": false
+    },
+    "thinking": {
+      "enabled": false,
+      "emitMode": "on_end"
     }
   }
 }

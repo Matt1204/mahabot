@@ -1,27 +1,24 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import type { AgentProgressUpdatePayload, InFlightUpdateDetails } from "../src/agent/progress/types.js";
-import { IN_FLIGHT_UPDATE_LIMIT } from "../src/agent/progress/types.js";
+import type { InFlightUpdateDetails } from "../src/agent/progress/types.js";
+import type { AgentRuntimeStatusMessage } from "../src/agent/runtimeStatus/types.js";
 import { createInFlightUpdateTool } from "../src/agent/tools/inFlightUpdateTool.ts";
 
 describe("createInFlightUpdateTool", () => {
   test("exposes standard tool name in_flight_update", () => {
     const tool = createInFlightUpdateTool({
-      sink: () => {},
-      quotaRef: { used: 0 },
+      publishStatus: () => {},
     });
     assert.equal(tool.name, "in_flight_update");
   });
 
-  test("successful call delivers payload, increments used, and returns quota + delivered", async () => {
-    const received: AgentProgressUpdatePayload[] = [];
-    const quotaRef = { used: 0 };
+  test("successful call publishes runtime status and returns delivered", async () => {
+    const received: AgentRuntimeStatusMessage[] = [];
     const fixedNow = () => 42_000;
 
     const tool = createInFlightUpdateTool({
-      sink: (p) => received.push(p),
-      quotaRef,
+      publishStatus: (message) => received.push(message),
       now: fixedNow,
     });
 
@@ -36,18 +33,14 @@ describe("createInFlightUpdateTool", () => {
     const details = result.details as InFlightUpdateDetails;
     assert.equal(details.delivered, true);
     assert.equal(details.droppedReason, undefined);
-    assert.deepEqual(details.quota, {
-      limit: IN_FLIGHT_UPDATE_LIMIT,
-      used: 1,
-      remaining: IN_FLIGHT_UPDATE_LIMIT - 1,
-    });
-    assert.equal(quotaRef.used, 1);
 
     assert.equal(result.content[0]?.type, "text");
-    assert.match((result.content[0] as { text: string }).text, /2 update\(s\) remaining/);
+    assert.match((result.content[0] as { text: string }).text, /Progress update sent/);
 
     assert.equal(received.length, 1);
-    assert.deepEqual(received[0], {
+    assert.equal(received[0].kind, "agent.runtime.inflight_update");
+    assert.equal(received[0].text, "Doing work | next: Run tests | 50%");
+    assert.deepEqual(received[0].raw, {
       message: "Doing work",
       nextStep: "Run tests",
       progressPercent: 50,
@@ -57,12 +50,10 @@ describe("createInFlightUpdateTool", () => {
     });
   });
 
-  test("FIFO: multiple successful deliveries preserve call order in sink", async () => {
+  test("FIFO: multiple successful deliveries preserve publish order", async () => {
     const order: string[] = [];
-    const quotaRef = { used: 0 };
     const tool = createInFlightUpdateTool({
-      sink: (p) => order.push(p.message),
-      quotaRef,
+      publishStatus: (message) => order.push(message.text),
     });
 
     await tool.execute("a", { message: "first" });
@@ -70,90 +61,63 @@ describe("createInFlightUpdateTool", () => {
     await tool.execute("c", { message: "third" });
 
     assert.deepEqual(order, ["first", "second", "third"]);
-    assert.equal(quotaRef.used, 3);
   });
 
-  test("quota: allows exactly IN_FLIGHT_UPDATE_LIMIT successful deliveries per user turn", async () => {
-    const quotaRef = { used: 0 };
+  test("many sequential successful calls are allowed", async () => {
+    let count = 0;
     const tool = createInFlightUpdateTool({
-      sink: () => {},
-      quotaRef,
-    });
-
-    for (let i = 0; i < IN_FLIGHT_UPDATE_LIMIT; i++) {
-      const r = await tool.execute(`ok-${i}`, { message: `step ${i}` });
-      const d = r.details as InFlightUpdateDetails;
-      assert.equal(d.delivered, true);
-      assert.equal(d.quota.used, i + 1);
-      assert.equal(d.quota.remaining, IN_FLIGHT_UPDATE_LIMIT - (i + 1));
-    }
-
-    assert.equal(quotaRef.used, IN_FLIGHT_UPDATE_LIMIT);
-
-    const denied = await tool.execute("denied", { message: "one too many" });
-    const dd = denied.details as InFlightUpdateDetails;
-    assert.equal(dd.delivered, false);
-    assert.equal(dd.droppedReason, "quota_exceeded");
-    assert.deepEqual(dd.quota, {
-      limit: IN_FLIGHT_UPDATE_LIMIT,
-      used: IN_FLIGHT_UPDATE_LIMIT,
-      remaining: 0,
-    });
-    assert.equal(quotaRef.used, IN_FLIGHT_UPDATE_LIMIT);
-  });
-
-  test("validation_error: empty message after trim does not consume quota", async () => {
-    let sinkCalls = 0;
-    const quotaRef = { used: 0 };
-    const tool = createInFlightUpdateTool({
-      sink: () => {
-        sinkCalls += 1;
+      publishStatus: () => {
+        count += 1;
       },
-      quotaRef,
+    });
+
+    for (let i = 0; i < 20; i++) {
+      const r = await tool.execute(`ok-${i}`, { message: `step ${i}` });
+      assert.equal((r.details as InFlightUpdateDetails).delivered, true);
+    }
+    assert.equal(count, 20);
+  });
+
+  test("validation_error: empty message after trim", async () => {
+    let publishCalls = 0;
+    const tool = createInFlightUpdateTool({
+      publishStatus: () => {
+        publishCalls += 1;
+      },
     });
 
     const result = await tool.execute("v1", { message: "   " });
     const d = result.details as InFlightUpdateDetails;
     assert.equal(d.delivered, false);
     assert.equal(d.droppedReason, "validation_error");
-    assert.equal(d.quota.used, 0);
-    assert.equal(quotaRef.used, 0);
-    assert.equal(sinkCalls, 0);
+    assert.equal(publishCalls, 0);
   });
 
-  test("validation_error: message longer than 280 chars does not consume quota", async () => {
-    const quotaRef = { used: 0 };
+  test("validation_error: message longer than 280 chars", async () => {
     const tool = createInFlightUpdateTool({
-      sink: () => {},
-      quotaRef,
+      publishStatus: () => {},
     });
 
     const result = await tool.execute("v2", { message: "x".repeat(281) });
     const d = result.details as InFlightUpdateDetails;
     assert.equal(d.delivered, false);
     assert.equal(d.droppedReason, "validation_error");
-    assert.equal(quotaRef.used, 0);
   });
 
-  test("validation_error: nextStep empty when provided does not consume quota", async () => {
-    const quotaRef = { used: 0 };
+  test("validation_error: nextStep empty when provided", async () => {
     const tool = createInFlightUpdateTool({
-      sink: () => {},
-      quotaRef,
+      publishStatus: () => {},
     });
 
     const result = await tool.execute("v3", { message: "ok", nextStep: "  " });
     const d = result.details as InFlightUpdateDetails;
     assert.equal(d.delivered, false);
     assert.equal(d.droppedReason, "validation_error");
-    assert.equal(quotaRef.used, 0);
   });
 
   test("validation_error: progressPercent must be integer 0–100", async () => {
-    const quotaRef = { used: 0 };
     const tool = createInFlightUpdateTool({
-      sink: () => {},
-      quotaRef,
+      publishStatus: () => {},
     });
 
     const half = await tool.execute("v4a", { message: "m", progressPercent: 12.5 });
@@ -161,18 +125,14 @@ describe("createInFlightUpdateTool", () => {
 
     const neg = await tool.execute("v4b", { message: "m", progressPercent: -1 });
     assert.equal((neg.details as InFlightUpdateDetails).droppedReason, "validation_error");
-
-    assert.equal(quotaRef.used, 0);
   });
 
-  test("sink_failed: sink throw does not increment used and returns structured failure", async () => {
-    const quotaRef = { used: 0 };
+  test("sink_failed: publish throw returns structured failure", async () => {
     const warns: string[] = [];
     const tool = createInFlightUpdateTool({
-      sink: () => {
-        throw new Error("sink boom");
+      publishStatus: () => {
+        throw new Error("publish boom");
       },
-      quotaRef,
       logger: { warn: (m: string) => warns.push(m) },
     });
 
@@ -180,20 +140,16 @@ describe("createInFlightUpdateTool", () => {
     const d = result.details as InFlightUpdateDetails;
     assert.equal(d.delivered, false);
     assert.equal(d.droppedReason, "sink_failed");
-    assert.equal(d.quota.used, 0);
-    assert.equal(quotaRef.used, 0);
-    assert.ok(warns.some((w) => w.includes("sink failed")));
+    assert.ok(warns.some((w) => w.includes("publish failed")));
   });
 
-  test("optional fields omitted: payload omits nextStep when not provided", async () => {
-    const received: AgentProgressUpdatePayload[] = [];
+  test("optional fields omitted: text keeps only message", async () => {
+    const received: AgentRuntimeStatusMessage[] = [];
     const tool = createInFlightUpdateTool({
-      sink: (p) => received.push(p),
-      quotaRef: { used: 0 },
+      publishStatus: (message) => received.push(message),
     });
 
     await tool.execute("opt", { message: "only message" });
-    assert.equal(received[0]?.nextStep, undefined);
-    assert.equal(received[0]?.progressPercent, undefined);
+    assert.equal(received[0]?.text, "only message");
   });
 });

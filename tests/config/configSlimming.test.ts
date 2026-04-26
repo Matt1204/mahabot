@@ -111,6 +111,68 @@ describe("config slimming validation", () => {
       /params\.model\.baseUrl is removed/
     );
   });
+
+  test("rejects removed agent.runtimeStatus and validates eventInspection.thinking", () => {
+    const config = cloneConfig() as any;
+    config.agent.runtimeStatus = { emitThinking: true };
+
+    const manager = new ConfigManager();
+    assert.throws(
+      () => manager.set(config),
+      /agent\.runtimeStatus is removed/
+    );
+
+    const validConfig = cloneConfig() as any;
+    validConfig.eventInspection.thinking = {
+      enabled: true,
+      emitMode: "on_end",
+      maxChars: 120,
+    };
+
+    const normalized = manager.set(validConfig);
+    assert.equal(normalized.eventInspection.thinking.enabled, true);
+    assert.equal(normalized.eventInspection.thinking.emitMode, "on_end");
+    assert.equal(normalized.eventInspection.thinking.maxChars, 120);
+  });
+
+  test("validates ingress.telegram schema and normalizes allowed user ids", () => {
+    const config = cloneConfig() as any;
+    config.ingress.telegram.enabled = true;
+    config.ingress.telegram.botTokenEnvVar = " TELEGRAM_BOT_TOKEN ";
+    config.ingress.telegram.allowedChatIds = ["123", 456];
+
+    const manager = new ConfigManager();
+    const normalized = manager.set(config);
+
+    assert.equal(normalized.ingress.telegram.enabled, true);
+    assert.equal(normalized.ingress.telegram.botTokenEnvVar, "TELEGRAM_BOT_TOKEN");
+    assert.deepEqual(normalized.ingress.telegram.allowedChatIds, ["123", "456"]);
+  });
+
+  test("rejects invalid ingress.telegram allowedChatIds and botTokenEnvVar", () => {
+    const manager = new ConfigManager();
+
+    const invalidToken = cloneConfig() as any;
+    invalidToken.ingress.telegram.botTokenEnvVar = "   ";
+    assert.throws(
+      () => manager.set(invalidToken),
+      /ingress\.telegram\.botTokenEnvVar must be a non-empty string/
+    );
+
+    const invalidAllowedShape = cloneConfig() as any;
+    invalidAllowedShape.ingress.telegram.allowedChatIds = "123";
+    assert.throws(
+      () => manager.set(invalidAllowedShape),
+      /ingress\.telegram\.allowedChatIds must be an array/
+    );
+
+    const invalidAllowedEntry = cloneConfig() as any;
+    invalidAllowedEntry.ingress.telegram.allowedChatIds = [""];
+    assert.throws(
+      () => manager.set(invalidAllowedEntry),
+      /ingress\.telegram\.allowedChatIds\[0\] must be non-empty/
+    );
+  });
 });
 
 describe("modelFactory fallback order", () => {

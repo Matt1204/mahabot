@@ -1,17 +1,11 @@
 /**
- * `in_flight_update` tool: validates params, enforces IN_FLIGHT_UPDATE_LIMIT against shared quotaRef,
- * then calls ProgressUpdateSink synchronously. Quota increments only after a successful sink call.
- * Not part of EventInspection; paired with gateway wiring (manager.ts) + Agent.invokeAgentLoop reset.
+ * `in_flight_update` tool: validates params, builds a user-facing status text,
+ * and publishes runtime status to the MessageBus path.
  */
 import { Type } from "@mariozechner/pi-ai";
 
-import type {
-  AgentProgressUpdatePayload,
-  InFlightUpdateDetails,
-  InFlightUpdateQuotaRef,
-  ProgressUpdateSink,
-} from "../progress/types.js";
-import { IN_FLIGHT_UPDATE_LIMIT } from "../progress/types.js";
+import type { InFlightUpdateDetails } from "../progress/types.js";
+import type { AgentRuntimeStatusPublisher } from "../runtimeStatus/types.js";
 import type { DescribedAgentTool } from "./registry/types.js";
 import { textResult } from "./showcase/shared.js";
 
@@ -31,25 +25,15 @@ const parametersSchema = Type.Object({
 });
 
 export interface CreateInFlightUpdateToolInput {
-  sink: ProgressUpdateSink;
-  quotaRef: InFlightUpdateQuotaRef;
+  publishStatus: AgentRuntimeStatusPublisher;
   logger?: Pick<Console, "warn">;
   now?: () => number;
 }
 
-function quotaSnapshot(used: number) {
-  const limit = IN_FLIGHT_UPDATE_LIMIT;
-  const remaining = Math.max(0, limit - used);
-  return { limit, used, remaining };
-}
-
 function buildToolRulePrompt(): string {
   return [
-    "Send a **non-final** progress update to the user during multi-step work.",
-    "This is not the final answer, this is just a 'by the way' to inform user your plan, progress, and difficulty.",
-    "You are encouraged to send updates frequently.",
-    "Use this tool in parallel with other tools.",
-    "Do not use for trivial one-shot tasks.",
+    "Whenever you call **any other tool(s)** in an assistant turn, include **one** `in_flight_update` in the **same** tool-call batch (parallel with those tools).",
+    "Keep `message` short: current situation, intent, progress",
   ].join(" ");
 }
 
@@ -61,48 +45,34 @@ export function createInFlightUpdateTool(input: CreateInFlightUpdateToolInput): 
     name: "in_flight_update",
     label: "In-flight update",
     description:
-      "Send a one-way progress update to the user (current work and optional next step). Does not complete the task.",
+      "Non-final short message to user during multi-step work to explain your situation, intent, progress. **Pairing rule:** whenever you invoke any other tool(s), call `in_flight_update` once **in parallel** with that same round of tool calls.",
     toolRulePrompt: buildToolRulePrompt(),
     parameters: parametersSchema,
     async execute(_toolCallId, params) {
-      const snap = () => quotaSnapshot(input.quotaRef.used);
-
       let pct: number | undefined;
       if (params.progressPercent !== undefined) {
         const raw = params.progressPercent;
         if (!Number.isInteger(raw) || raw < 0 || raw > 100) {
-          return errorResult(
-            "progressPercent must be an integer between 0 and 100.",
-            "validation_error",
-            snap()
-          );
+          return errorResult("progressPercent must be an integer between 0 and 100.", "validation_error");
         }
         pct = raw;
       }
 
       const message = params.message.trim();
       if (message.length === 0 || message.length > 280) {
-        return errorResult("message must be 1–280 non-whitespace characters.", "validation_error", snap());
+        return errorResult("message must be 1–280 non-whitespace characters.", "validation_error");
       }
 
       let nextStep: string | undefined;
       if (params.nextStep !== undefined) {
         const ns = params.nextStep.trim();
         if (ns.length === 0 || ns.length > 200) {
-          return errorResult("nextStep must be 1–200 characters when provided.", "validation_error", snap());
+          return errorResult("nextStep must be 1–200 characters when provided.", "validation_error");
         }
         nextStep = ns;
       }
 
-      if (input.quotaRef.used >= IN_FLIGHT_UPDATE_LIMIT) {
-        return errorResult(
-          `Progress update quota exceeded (${IN_FLIGHT_UPDATE_LIMIT} per user turn).`,
-          "quota_exceeded",
-          snap()
-        );
-      }
-
-      const payload: AgentProgressUpdatePayload = {
+      const rawPayload = {
         message,
         nextStep,
         progressPercent: pct,
@@ -112,25 +82,25 @@ export function createInFlightUpdateTool(input: CreateInFlightUpdateToolInput): 
       };
 
       try {
-        // Sync sink: must not await network; failures become tool error without bumping quota.
-        input.sink(payload);
+        // Producer-side formatting rule:
+        // convert structured update fields to direct user-visible text before publishing.
+        input.publishStatus({
+          kind: "agent.runtime.inflight_update",
+          source: "in_flight_update",
+          priority: "normal",
+          text: formatInFlightText(rawPayload),
+          raw: rawPayload,
+          renderHints: {
+            style: "secondary",
+            prefix: "agent-update",
+          },
+        });
       } catch (error) {
-        logger.warn?.(`[in_flight_update] sink failed: ${String(error)}`);
-        return errorResult(
-          "Progress update could not be delivered (sink error).",
-          "sink_failed",
-          snap()
-        );
+        logger.warn?.(`[in_flight_update] publish failed: ${String(error)}`);
+        return errorResult("Progress update could not be delivered (publish error).", "sink_failed");
       }
 
-      input.quotaRef.used += 1;
-      const after = snap();
-      const details: InFlightUpdateDetails = {
-        delivered: true,
-        quota: after,
-      };
-      const text = `Progress update sent. ${after.remaining} update(s) remaining this user turn.`;
-      return textResult(text, details);
+      return textResult("Progress update sent.", { delivered: true });
     },
   };
 
@@ -139,13 +109,26 @@ export function createInFlightUpdateTool(input: CreateInFlightUpdateToolInput): 
 
 function errorResult(
   text: string,
-  reason: InFlightUpdateDetails["droppedReason"],
-  quota: InFlightUpdateDetails["quota"]
+  reason: NonNullable<InFlightUpdateDetails["droppedReason"]>
 ): ReturnType<typeof textResult<InFlightUpdateDetails>> {
   const details: InFlightUpdateDetails = {
     delivered: false,
     droppedReason: reason,
-    quota,
   };
   return textResult(text, details);
+}
+
+function formatInFlightText(payload: {
+  message: string;
+  nextStep?: string;
+  progressPercent?: number;
+}): string {
+  const parts = [payload.message];
+  if (payload.nextStep) {
+    parts.push(`next: ${payload.nextStep}`);
+  }
+  if (payload.progressPercent !== undefined) {
+    parts.push(`${payload.progressPercent}%`);
+  }
+  return parts.join(" | ");
 }

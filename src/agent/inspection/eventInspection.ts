@@ -1,12 +1,8 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 
 import type { EventInspectionConfig } from "../../config/types.js";
-import type {
-  InspectionChannel,
-  InspectionRenderedEvent,
-  InspectionSink,
-  InspectionTokenUsage,
-} from "./contracts.js";
+import type { AgentRuntimeStatusPublisher } from "../runtimeStatus/types.js";
+import type { InspectionTokenUsage } from "./contracts.js";
 import { formatToolEnd, formatToolStart, formatToolUpdate } from "./toolInspectionFormatters.js";
 
 interface ContextWatermarks {
@@ -14,39 +10,30 @@ interface ContextWatermarks {
   highWaterMark: number;
 }
 
-export interface EventInspectionSinkBinding {
-  channel: InspectionChannel;
-  sink: InspectionSink;
-}
-
 export interface EventInspectionDeps {
-  sinks: EventInspectionSinkBinding[];
+  publishStatus: AgentRuntimeStatusPublisher;
   logger?: Pick<Console, "debug" | "warn" | "error">;
-  now?: () => number;
-  supportsAnsi?: (channel: InspectionChannel) => boolean;
   getContextWatermarks?: () => ContextWatermarks | undefined;
 }
 
 /**
  * Subscribes to AgentEvent stream (via Agent.onAgentEvent). Two-stage microtask deferral:
  * (1) handleAgentEvent → queueMicrotask(processEvent) so the runtime's subscribe callback returns fast;
- * (2) per rendered line → queueMicrotask(sink.publish) so synchronous terminal I/O does not run on
- * the same tick as processEvent. Complements docs/progress_sink_and_inspection_sink.md sequence diagram.
+ * (2) per rendered line → queueMicrotask(publishStatus) so status publishing work does not run on
+ * the same tick as processEvent.
  */
 export class EventInspection {
   private readonly logger: Pick<Console, "debug" | "warn" | "error">;
-  private readonly now: () => number;
-  private readonly supportsAnsi: (channel: InspectionChannel) => boolean;
+  private readonly publishStatus: AgentRuntimeStatusPublisher;
   private readonly getContextWatermarks: () => ContextWatermarks | undefined;
   private lastUsageFingerprint: string | null = null;
+  private turnSeq = 0;
+  private assistantSeq = 0;
+  private activeThinkingByContentIndex = new Map<number, string>();
 
-  constructor(
-    private readonly config: EventInspectionConfig,
-    private readonly deps: EventInspectionDeps
-  ) {
+  constructor(private readonly config: EventInspectionConfig, deps: EventInspectionDeps) {
     this.logger = deps.logger ?? console;
-    this.now = deps.now ?? (() => Date.now());
-    this.supportsAnsi = deps.supportsAnsi ?? (() => false);
+    this.publishStatus = deps.publishStatus;
     this.getContextWatermarks = deps.getContextWatermarks ?? (() => undefined);
   }
 
@@ -57,12 +44,11 @@ export class EventInspection {
 
   private processEvent(event: AgentEvent): void {
     try {
-      if (!this.config.useEventInspection) {
-        return;
-      }
+      this.processThinkingEvent(event);
 
-      const includeMainEvent = shouldInclude(event.type, this.config);
-      const includeTokenUsage = this.config.showTokenUsage && event.type === "turn_end";
+      const includeMainEvent = this.config.useEventInspection && shouldInclude(event.type, this.config);
+      const includeTokenUsage =
+        this.config.useEventInspection && this.config.showTokenUsage && event.type === "turn_end";
 
       if (!includeMainEvent && !includeTokenUsage) {
         return;
@@ -79,60 +65,138 @@ export class EventInspection {
         this.lastUsageFingerprint = toUsageFingerprint(tokenUsage);
       }
 
-      for (const target of this.deps.sinks) {
-        const renderedEvents: InspectionRenderedEvent[] = [];
+      if (includeMainEvent) {
+        const lineParts = summarizeEvent(event);
+        queueMicrotask(() => {
+          try {
+            this.publishStatus({
+              kind: "agent.runtime.event",
+              source: "event_inspection",
+              priority: "low",
+              text: renderInspectionLine(lineParts.label, lineParts.content),
+              raw: {
+                eventType: event.type,
+              },
+              renderHints: {
+                style: "dim",
+                prefix: lineParts.label,
+              },
+            });
+          } catch (error) {
+            this.logger.warn(`[event inspection publish error] ${String(error)}`);
+          }
+        });
+      }
 
-        if (includeMainEvent) {
-          const lineParts = summarizeEvent(event);
-          renderedEvents.push({
-            channel: target.channel,
-            eventType: event.type,
-            line: renderInspectionLine(
-              lineParts.label,
-              lineParts.content,
-              target.channel,
-              this.supportsAnsi(target.channel)
-            ),
-            timestamp: this.now(),
-            metadata: {
-              kind: "event",
-            },
-          } satisfies InspectionRenderedEvent);
-        }
-
-        if (shouldEmitTokenUsage && tokenUsage) {
-          renderedEvents.push({
-            channel: target.channel,
-            eventType: event.type,
-            line: renderInspectionLine(
-              "token_usage",
-              formatTokenUsageLine(tokenUsage),
-              target.channel,
-              this.supportsAnsi(target.channel)
-            ),
-            timestamp: this.now(),
-            metadata: {
-              kind: "token_usage",
-              tokenUsage,
-            },
-          });
-        }
-
-        for (const rendered of renderedEvents) {
-          // Non-blocking guarantee:
-          // sink I/O should never run inline on the agent event callback path.
-          queueMicrotask(() => {
-            try {
-              target.sink.publish(rendered);
-            } catch (error) {
-              this.logger.warn(`[inspection sink error] ${String(error)}`);
-            }
-          });
-        }
+      if (shouldEmitTokenUsage && tokenUsage) {
+        queueMicrotask(() => {
+          try {
+            this.publishStatus({
+              kind: "agent.runtime.token_usage",
+              source: "event_inspection",
+              priority: "low",
+              text: renderInspectionLine("token_usage", formatTokenUsageLine(tokenUsage)),
+              raw: {
+                tokenUsage,
+              },
+              renderHints: {
+                style: "dim",
+                prefix: "token_usage",
+              },
+            });
+          } catch (error) {
+            this.logger.warn(`[token usage publish error] ${String(error)}`);
+          }
+        });
       }
     } catch (error) {
       // Inspection failures must never affect the agent loop.
       this.logger.warn(`[event inspection error] ${String(error)}`);
+    }
+  }
+
+  private processThinkingEvent(event: AgentEvent): void {
+    if (!this.config.thinking.enabled) {
+      return;
+    }
+
+    switch (event.type) {
+      case "turn_start":
+        this.turnSeq += 1;
+        this.activeThinkingByContentIndex.clear();
+        return;
+      case "message_start":
+        if (isAssistantMessage(event.message)) {
+          this.assistantSeq += 1;
+          this.activeThinkingByContentIndex.clear();
+        }
+        return;
+      case "message_end":
+        if (isAssistantMessage(event.message)) {
+          this.activeThinkingByContentIndex.clear();
+        }
+        return;
+      case "agent_end":
+        this.activeThinkingByContentIndex.clear();
+        return;
+      case "message_update":
+        this.handleThinkingUpdate(event);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private handleThinkingUpdate(event: Extract<AgentEvent, { type: "message_update" }>): void {
+    const assistantEvent = event.assistantMessageEvent;
+
+    switch (assistantEvent.type) {
+      case "thinking_start":
+        this.activeThinkingByContentIndex.set(assistantEvent.contentIndex, "");
+        return;
+      case "thinking_delta": {
+        const previous = this.activeThinkingByContentIndex.get(assistantEvent.contentIndex) ?? "";
+        this.activeThinkingByContentIndex.set(assistantEvent.contentIndex, previous + assistantEvent.delta);
+        return;
+      }
+      case "thinking_end": {
+        const rawThinking =
+          assistantEvent.content ??
+          this.activeThinkingByContentIndex.get(assistantEvent.contentIndex) ??
+          extractThinkingFromAssistantMessage(event.message, assistantEvent.contentIndex);
+        const thinkingText = normalizeThinkingText(rawThinking, this.config.thinking.maxChars);
+        this.activeThinkingByContentIndex.delete(assistantEvent.contentIndex);
+
+        if (!thinkingText) {
+          return;
+        }
+
+        queueMicrotask(() => {
+          try {
+            this.publishStatus({
+              kind: "agent.runtime.thinking",
+              source: "event_inspection",
+              priority: "low",
+              text: `[thinking] ${thinkingText}`,
+              raw: {
+                phase: "end",
+                turnSeq: this.turnSeq,
+                assistantSeq: this.assistantSeq,
+                contentIndex: assistantEvent.contentIndex,
+              },
+              renderHints: {
+                style: "dim",
+                prefix: "thinking",
+              },
+            });
+          } catch (error) {
+            this.logger.warn(`[thinking publish error] ${String(error)}`);
+          }
+        });
+        return;
+      }
+      default:
+        return;
     }
   }
 }
@@ -141,19 +205,8 @@ function shouldInclude(eventType: AgentEvent["type"], config: EventInspectionCon
   return config.include[eventType] === true;
 }
 
-function renderInspectionLine(
-  eventName: string,
-  content: string,
-  channel: InspectionChannel,
-  ansiEnabled: boolean
-): string {
-  const line = `[${eventName}] ${content}`;
-  if (channel !== "cli" || !ansiEnabled) {
-    return line;
-  }
-
-  // Keep inspection output subtle so it does not compete with user input/final answers.
-  return `\u001b[2m${line}\u001b[0m`;
+function renderInspectionLine(eventName: string, content: string): string {
+  return `[${eventName}] ${content}`;
 }
 
 function formatTokenUsageLine(usage: InspectionTokenUsage): string {
@@ -262,4 +315,44 @@ function summarizeEvent(event: AgentEvent): { label: string; content: string } {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isAssistantMessage(message: unknown): boolean {
+  return isRecord(message) && message.role === "assistant";
+}
+
+function extractThinkingFromAssistantMessage(message: unknown, contentIndex: number): string {
+  if (!isRecord(message) || !Array.isArray(message.content)) {
+    return "";
+  }
+
+  const block = message.content[contentIndex];
+  if (!isRecord(block) || block.type !== "thinking") {
+    return "";
+  }
+
+  if (typeof block.thinking === "string") {
+    return block.thinking;
+  }
+  if (typeof block.text === "string") {
+    return block.text;
+  }
+  return "";
+}
+
+function normalizeThinkingText(value: unknown, maxChars?: number): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+
+  if (maxChars === undefined || trimmed.length <= maxChars) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxChars)}...(truncated)`;
 }

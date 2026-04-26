@@ -18,7 +18,6 @@ import type {
   MemoryBundle,
   OutboundMessageTemp,
 } from "./types.js";
-import type { InFlightUpdateQuotaRef } from "./progress/types.js";
 import {
   MessagePersistenceCoordinator,
   type ContextBudgetSnapshot,
@@ -32,7 +31,6 @@ export class Agent {
   private readonly outboundSink?: (message: OutboundMessageTemp) => Promise<void> | void;
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   private readonly onAgentEvent?: (event: AgentEvent) => void;
-  private readonly progressUpdateQuotaRef?: InFlightUpdateQuotaRef;
   private readonly messagePersistenceCoordinator?: MessagePersistenceCoordinator;
 
   private running = false;
@@ -77,7 +75,6 @@ export class Agent {
     this.outboundSink = deps.outboundSink;
     this.memoryAssembler = deps.memoryAssembler;
     this.onAgentEvent = deps.onAgentEvent;
-    this.progressUpdateQuotaRef = deps.progressUpdateQuotaRef;
     this.messagePersistenceCoordinator = deps.messagePersistence
       ? new MessagePersistenceCoordinator(deps.messagePersistence, {
           logger: this.logger,
@@ -92,8 +89,8 @@ export class Agent {
       () => undefined
     );
 
-    // Keep this subscription always on so the playground can observe full event flow.
-    // `onAgentEvent` feeds EventInspection → InspectionSink (parallel to tools → ProgressUpdateSink).
+    // Keep this subscription always on so observers can project runtime events to MessageBus.
+    // The callback must never throw into the agent loop.
     this.agentRuntime.subscribe((event) => {
       this.logger.debug(`[pi-mono event] ${String((event as any).type)}`);
       let eventForInspection: AgentEvent = event;
@@ -207,11 +204,6 @@ export class Agent {
   }
 
   async invokeAgentLoop(messages: AgentMessage[]): Promise<AgentMessage> {
-    // Same mutable object as gateway's `progressUpdateQuotaRef` + assembleTools; reset once per
-    // prompt() so `in_flight_update` quota applies per user turn, not across turns.
-    if (this.progressUpdateQuotaRef) {
-      this.progressUpdateQuotaRef.used = 0;
-    }
     await this.agentRuntime.prompt(messages);
     await this.ensureContextSize();
 

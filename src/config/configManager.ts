@@ -276,6 +276,8 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: schemaVersion must be a number.");
   }
 
+  validateIngressConfig(merged.ingress);
+
   // Require at least one enabled/available provider entry to run the agent.
   if (!Array.isArray(merged.agent.llmProviders) || merged.agent.llmProviders.length === 0) {
     throw new Error("Invalid config: agent.llmProviders must contain at least one provider.");
@@ -382,6 +384,12 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
 
   if (typeof merged.agent.maxTokens !== "number" || merged.agent.maxTokens < 1) {
     throw new Error("Invalid config: agent.maxTokens must be >= 1.");
+  }
+
+  if ("runtimeStatus" in (merged.agent as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "Invalid config: agent.runtimeStatus is removed. Use eventInspection.thinking.enabled instead."
+    );
   }
 
   if (typeof merged.agent.workspaceRoot !== "string" || merged.agent.workspaceRoot.trim().length === 0) {
@@ -639,6 +647,65 @@ function validateEventInspectionConfig(
       throw new Error(`Invalid config: eventInspection.include.${key} must be a boolean.`);
     }
   }
+
+  if (!isRecord(value.thinking)) {
+    throw new Error("Invalid config: eventInspection.thinking must be an object.");
+  }
+
+  if (typeof value.thinking.enabled !== "boolean") {
+    throw new Error("Invalid config: eventInspection.thinking.enabled must be a boolean.");
+  }
+
+  if (value.thinking.emitMode !== "on_end") {
+    throw new Error("Invalid config: eventInspection.thinking.emitMode must be 'on_end'.");
+  }
+
+  if (
+    value.thinking.maxChars !== undefined &&
+    (!Number.isInteger(value.thinking.maxChars) || value.thinking.maxChars < 1)
+  ) {
+    throw new Error("Invalid config: eventInspection.thinking.maxChars must be an integer >= 1 when provided.");
+  }
+}
+
+function validateIngressConfig(value: AppConfig["ingress"]): asserts value is AppConfig["ingress"] {
+  if (!isRecord(value)) {
+    throw new Error("Invalid config: ingress must be an object.");
+  }
+
+  if (!isRecord(value.telegram)) {
+    throw new Error("Invalid config: ingress.telegram must be an object.");
+  }
+
+  const telegram = value.telegram as Record<string, unknown>;
+
+  if (typeof telegram.enabled !== "boolean") {
+    throw new Error("Invalid config: ingress.telegram.enabled must be a boolean.");
+  }
+
+  if (typeof telegram.botTokenEnvVar !== "string" || telegram.botTokenEnvVar.trim().length === 0) {
+    throw new Error("Invalid config: ingress.telegram.botTokenEnvVar must be a non-empty string.");
+  }
+  telegram.botTokenEnvVar = telegram.botTokenEnvVar.trim();
+
+  if (!Array.isArray(telegram.allowedChatIds)) {
+    throw new Error("Invalid config: ingress.telegram.allowedChatIds must be an array.");
+  }
+
+  telegram.allowedChatIds = telegram.allowedChatIds.map((entry, index) => {
+    if (typeof entry !== "string" && typeof entry !== "number") {
+      throw new Error(
+        `Invalid config: ingress.telegram.allowedChatIds[${index}] must be a string or number.`
+      );
+    }
+    const normalized = String(entry).trim();
+    if (!normalized) {
+      throw new Error(
+        `Invalid config: ingress.telegram.allowedChatIds[${index}] must be non-empty after trim.`
+      );
+    }
+    return normalized;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

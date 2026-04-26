@@ -74,8 +74,12 @@ export class MessagePersistenceCoordinator {
     }
   }
 
-  noteTurnUsage(totalTokens: number): ContextBudgetSnapshot {
-    this.curContextSize = totalTokens;
+  noteTurnUsage(totalTokens: number | { totalTokens?: number }): ContextBudgetSnapshot {
+    // Accept both legacy usage object and direct numeric token count.
+    // This keeps coordinator callers simple across refactor boundaries.
+    const normalizedTotal =
+      typeof totalTokens === "number" ? totalTokens : totalTokens.totalTokens ?? 0;
+    this.curContextSize = normalizedTotal;
     return this.getContextBudgetSnapshot();
   }
 
