@@ -2,8 +2,26 @@ export type MessageDirection = "user_to_agent" | "agent_to_user";
 export type MessagePriority = "high" | "normal" | "low";
 
 export type UserToAgentPart =
-  | { type: "text"; text: string }
-  | { type: "image"; url: string; mimeType?: string };
+  | {
+      type: "text";
+      text: string;
+      origin?: "cli" | "telegram_text" | "telegram_voice_transcript";
+    }
+  | {
+      type: "image";
+      source: "local_file";
+      path: string;
+      mimeType: string;
+      caption?: string;
+      width?: number;
+      height?: number;
+      telegram?: {
+        fileId: string;
+        fileUniqueId: string;
+        messageId: number;
+        mediaGroupId?: string;
+      };
+    };
 
 export interface UserToAgentPayload {
   parts: UserToAgentPart[];

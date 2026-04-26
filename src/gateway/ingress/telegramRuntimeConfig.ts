@@ -3,6 +3,7 @@ import type { AppConfig } from "../../config/index.js";
 export interface TelegramRuntimeConfig {
   botToken: string;
   allowedUserIds: ReadonlySet<string>;
+  media: AppConfig["ingress"]["telegram"]["media"];
 }
 
 export function resolveTelegramRuntimeConfig(
@@ -47,5 +48,6 @@ export function resolveTelegramRuntimeConfig(
   return {
     botToken,
     allowedUserIds,
+    media: telegram.media,
   };
 }

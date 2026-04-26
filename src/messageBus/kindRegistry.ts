@@ -94,23 +94,70 @@ function validateUserPart(part: UserToAgentPart): void {
   }
 
   if (part.type === "text") {
-    if (typeof part.text !== "string") {
-      throw new Error("Invalid user_to_agent payload: text part must contain text string.");
+    if (typeof part.text !== "string" || part.text.trim().length === 0) {
+      throw new Error("Invalid user_to_agent payload: text part must contain non-empty text string.");
+    }
+    if (
+      part.origin !== undefined &&
+      part.origin !== "cli" &&
+      part.origin !== "telegram_text" &&
+      part.origin !== "telegram_voice_transcript"
+    ) {
+      throw new Error("Invalid user_to_agent payload: text.origin must be cli|telegram_text|telegram_voice_transcript.");
     }
     return;
   }
 
   if (part.type === "image") {
-    if (typeof part.url !== "string" || part.url.length === 0) {
-      throw new Error("Invalid user_to_agent payload: image part must contain non-empty url.");
+    if (part.source !== "local_file") {
+      throw new Error("Invalid user_to_agent payload: image.source must be local_file.");
     }
-    if (part.mimeType !== undefined && typeof part.mimeType !== "string") {
-      throw new Error("Invalid user_to_agent payload: image.mimeType must be a string when provided.");
+    if (typeof part.path !== "string" || part.path.trim().length === 0) {
+      throw new Error("Invalid user_to_agent payload: image part must contain non-empty path.");
+    }
+    if (typeof part.mimeType !== "string" || part.mimeType.trim().length === 0) {
+      throw new Error("Invalid user_to_agent payload: image.mimeType must be a non-empty string.");
+    }
+    if (part.caption !== undefined && typeof part.caption !== "string") {
+      throw new Error("Invalid user_to_agent payload: image.caption must be a string when provided.");
+    }
+    if (part.width !== undefined && !isFinitePositiveNumber(part.width)) {
+      throw new Error("Invalid user_to_agent payload: image.width must be a finite positive number when provided.");
+    }
+    if (part.height !== undefined && !isFinitePositiveNumber(part.height)) {
+      throw new Error("Invalid user_to_agent payload: image.height must be a finite positive number when provided.");
+    }
+    if (part.telegram !== undefined) {
+      validateTelegramImageMetadata(part.telegram);
     }
     return;
   }
 
   throw new Error("Invalid user_to_agent payload: part.type must be text|image.");
+}
+
+function isFinitePositiveNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function validateTelegramImageMetadata(value: unknown): void {
+  if (!value || typeof value !== "object") {
+    throw new Error("Invalid user_to_agent payload: image.telegram must be an object when provided.");
+  }
+
+  const metadata = value as Record<string, unknown>;
+  if (typeof metadata.fileId !== "string" || metadata.fileId.length === 0) {
+    throw new Error("Invalid user_to_agent payload: image.telegram.fileId must be a non-empty string.");
+  }
+  if (typeof metadata.fileUniqueId !== "string" || metadata.fileUniqueId.length === 0) {
+    throw new Error("Invalid user_to_agent payload: image.telegram.fileUniqueId must be a non-empty string.");
+  }
+  if (typeof metadata.messageId !== "number" || !Number.isFinite(metadata.messageId)) {
+    throw new Error("Invalid user_to_agent payload: image.telegram.messageId must be a finite number.");
+  }
+  if (metadata.mediaGroupId !== undefined && typeof metadata.mediaGroupId !== "string") {
+    throw new Error("Invalid user_to_agent payload: image.telegram.mediaGroupId must be a string when provided.");
+  }
 }
 
 /**

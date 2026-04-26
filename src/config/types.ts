@@ -7,6 +7,19 @@ export interface TelegramIngressConfig {
   enabled: boolean;
   botTokenEnvVar: string;
   allowedChatIds: string[];
+  media: TelegramMediaIngressConfig;
+}
+
+export interface TelegramMediaIngressConfig {
+  pendingImageTimeoutMs: number;
+  ffmpegCommand: string;
+  transcription: TelegramTranscriptionConfig;
+}
+
+export interface TelegramTranscriptionConfig {
+  model: string;
+  apiKeyEnvVar: string;
+  prompt: string;
 }
 
 export interface IngressConfig {
@@ -115,6 +128,16 @@ export const DEFAULT_CONFIG: AppConfig = {
       enabled: false,
       botTokenEnvVar: "TELEGRAM_BOT_TOKEN",
       allowedChatIds: [],
+      media: {
+        pendingImageTimeoutMs: 10 * 60 * 1000,
+        ffmpegCommand: "ffmpeg",
+        transcription: {
+          model: "gpt-4o-mini-transcribe",
+          apiKeyEnvVar: "OPENAI_API_KEY",
+          prompt:
+            "The speaker is chatting with mahabot. The conversation is usually in Chinese. Transcribe the user's words accurately and keep the original language.",
+        },
+      },
     },
   },
   agent: {

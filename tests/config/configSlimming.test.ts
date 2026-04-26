@@ -147,6 +147,8 @@ describe("config slimming validation", () => {
     assert.equal(normalized.ingress.telegram.enabled, true);
     assert.equal(normalized.ingress.telegram.botTokenEnvVar, "TELEGRAM_BOT_TOKEN");
     assert.deepEqual(normalized.ingress.telegram.allowedChatIds, ["123", "456"]);
+    assert.equal(normalized.ingress.telegram.media.pendingImageTimeoutMs, 600000);
+    assert.equal(normalized.ingress.telegram.media.transcription.model, "gpt-4o-mini-transcribe");
   });
 
   test("rejects invalid ingress.telegram allowedChatIds and botTokenEnvVar", () => {
@@ -171,6 +173,13 @@ describe("config slimming validation", () => {
     assert.throws(
       () => manager.set(invalidAllowedEntry),
       /ingress\.telegram\.allowedChatIds\[0\] must be non-empty/
+    );
+
+    const invalidMediaTimeout = cloneConfig() as any;
+    invalidMediaTimeout.ingress.telegram.media.pendingImageTimeoutMs = 999;
+    assert.throws(
+      () => manager.set(invalidMediaTimeout),
+      /ingress\.telegram\.media\.pendingImageTimeoutMs/
     );
   });
 });

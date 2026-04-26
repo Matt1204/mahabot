@@ -6,6 +6,7 @@ import {
   parseAgentResponseToOutboundTemp,
   parseToMsgForCliTemp,
   toAgentMessages,
+  wrapPartsToInboundMessageTemp,
   wrapToInboundMessageTemp,
 } from "./mappers/message.mapper.js";
 import { createAgentRuntime as createPiAgentRuntime } from "./runtime/agentRuntimeFactory.js";
@@ -17,6 +18,7 @@ import type {
   InboundMessageTemp,
   MemoryBundle,
   OutboundMessageTemp,
+  UserTurnInput,
 } from "./types.js";
 import {
   MessagePersistenceCoordinator,
@@ -148,10 +150,7 @@ export class Agent {
       }
 
       await this.runExclusive(async () => {
-        const llmMessages = await this.processInboundMessage(inbound);
-        const assistantMessage = await this.invokeAgentLoop(llmMessages);
-        const outbound = await this.parseAgentResponse(assistantMessage, inbound);
-        await this.sendOutboundMessage(outbound);
+        await this.executeInboundTurn(inbound);
       });
     }
   }
@@ -188,7 +187,9 @@ export class Agent {
 
   async processInboundMessage(input: InboundMessageTemp): Promise<AgentMessage[]> {
     const memory = await this.assembleMemory(input);
-    return toAgentMessages(input, memory);
+    return toAgentMessages(input, memory, {
+      supportsImageInput: this.supportsImageInput(),
+    });
   }
 
   async assembleMemory(input: InboundMessageTemp): Promise<MemoryBundle> {
@@ -247,17 +248,21 @@ export class Agent {
   ): Promise<CliTurnResult> {
     return this.runExclusive(async () => {
       const inbound = this.wrapToInboundMessageTemp(cliMsg, channel, chatId, userId);
-      const llmMessages = await this.processInboundMessage(inbound);
+      return this.executeInboundTurn(inbound);
+    });
+  }
 
-      const assistantMessage = await this.invokeAgentLoop(llmMessages);
-      const outbound = await this.parseAgentResponse(assistantMessage, inbound);
-      await this.sendOutboundMessage(outbound);
-
-      return {
-        inbound,
-        outbound,
-        cliMessage: this.parseToMsgForCliTemp(outbound),
-      };
+  async runUserTurn(input: UserTurnInput): Promise<CliTurnResult> {
+    return this.runExclusive(async () => {
+      const inbound = wrapPartsToInboundMessageTemp(
+        input.parts,
+        this.now,
+        input.channel ?? "unknown",
+        input.chatId ?? "local",
+        input.userId ?? "unknown-user",
+        input.metadata
+      );
+      return this.executeInboundTurn(inbound);
     });
   }
 
@@ -272,6 +277,24 @@ export class Agent {
 
   parseToMsgForCliTemp(outbound: OutboundMessageTemp | null): string {
     return parseToMsgForCliTemp(outbound);
+  }
+
+  private async executeInboundTurn(inbound: InboundMessageTemp): Promise<CliTurnResult> {
+    const llmMessages = await this.processInboundMessage(inbound);
+    const assistantMessage = await this.invokeAgentLoop(llmMessages);
+    const outbound = await this.parseAgentResponse(assistantMessage, inbound);
+    await this.sendOutboundMessage(outbound);
+
+    return {
+      inbound,
+      outbound,
+      cliMessage: this.parseToMsgForCliTemp(outbound),
+    };
+  }
+
+  private supportsImageInput(): boolean {
+    const modelInput = (this.agentRuntime.state.model as { input?: unknown }).input;
+    return Array.isArray(modelInput) && modelInput.includes("image");
   }
 
   injectSteering(cliMsg: string): void {

@@ -1,7 +1,15 @@
 import type { AgentToUserPayload, MessageBus } from "../../messageBus/types.js";
+import { formatMarkdownForTelegram } from "./telegramTextFormatter.js";
+
+export interface TelegramSendOptions {
+  parse_mode?: "HTML";
+  link_preview_options?: {
+    is_disabled: boolean;
+  };
+}
 
 export interface TelegramSendClient {
-  sendMessage: (chatId: string, text: string) => Promise<unknown>;
+  sendMessage: (chatId: string, text: string, options?: TelegramSendOptions) => Promise<unknown>;
 }
 
 export interface CreateTelegramEgressRelayInput {
@@ -30,13 +38,33 @@ export function createTelegramEgressRelay(input: CreateTelegramEgressRelayInput)
         return;
       }
 
-      void input.client.sendMessage(input.chatId, text).catch((error) => {
-        logger.warn?.(`[telegram-egress] sendMessage failed: ${String(error)}`);
-      });
+      const formatted = formatMarkdownForTelegram(text);
+      void sendFormattedWithPlainTextFallback(input.client, input.chatId, text, formatted)
+        .catch((error) => {
+          logger.warn?.(`[telegram-egress] sendMessage failed: ${String(error)}`);
+        });
     },
     {
       direction: "agent_to_user",
       sessionId: input.sessionId,
     }
   );
+}
+
+async function sendFormattedWithPlainTextFallback(
+  client: TelegramSendClient,
+  chatId: string,
+  originalText: string,
+  formatted: ReturnType<typeof formatMarkdownForTelegram>
+): Promise<void> {
+  try {
+    await client.sendMessage(chatId, formatted.text, {
+      parse_mode: formatted.parseMode,
+      link_preview_options: {
+        is_disabled: true,
+      },
+    });
+  } catch {
+    await client.sendMessage(chatId, originalText);
+  }
 }
