@@ -276,6 +276,8 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
     throw new Error("Invalid config: schemaVersion must be a number.");
   }
 
+  validateIngressConfig(merged.ingress);
+
   // Require at least one enabled/available provider entry to run the agent.
   if (!Array.isArray(merged.agent.llmProviders) || merged.agent.llmProviders.length === 0) {
     throw new Error("Invalid config: agent.llmProviders must contain at least one provider.");
@@ -664,6 +666,46 @@ function validateEventInspectionConfig(
   ) {
     throw new Error("Invalid config: eventInspection.thinking.maxChars must be an integer >= 1 when provided.");
   }
+}
+
+function validateIngressConfig(value: AppConfig["ingress"]): asserts value is AppConfig["ingress"] {
+  if (!isRecord(value)) {
+    throw new Error("Invalid config: ingress must be an object.");
+  }
+
+  if (!isRecord(value.telegram)) {
+    throw new Error("Invalid config: ingress.telegram must be an object.");
+  }
+
+  const telegram = value.telegram as Record<string, unknown>;
+
+  if (typeof telegram.enabled !== "boolean") {
+    throw new Error("Invalid config: ingress.telegram.enabled must be a boolean.");
+  }
+
+  if (typeof telegram.botTokenEnvVar !== "string" || telegram.botTokenEnvVar.trim().length === 0) {
+    throw new Error("Invalid config: ingress.telegram.botTokenEnvVar must be a non-empty string.");
+  }
+  telegram.botTokenEnvVar = telegram.botTokenEnvVar.trim();
+
+  if (!Array.isArray(telegram.allowedChatIds)) {
+    throw new Error("Invalid config: ingress.telegram.allowedChatIds must be an array.");
+  }
+
+  telegram.allowedChatIds = telegram.allowedChatIds.map((entry, index) => {
+    if (typeof entry !== "string" && typeof entry !== "number") {
+      throw new Error(
+        `Invalid config: ingress.telegram.allowedChatIds[${index}] must be a string or number.`
+      );
+    }
+    const normalized = String(entry).trim();
+    if (!normalized) {
+      throw new Error(
+        `Invalid config: ingress.telegram.allowedChatIds[${index}] must be non-empty after trim.`
+      );
+    }
+    return normalized;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

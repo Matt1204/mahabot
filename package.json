@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx src/cli.ts cli",
     "cli": "tsx src/cli.ts cli",
+    "telegram": "tsx src/cli.ts telegram",
     "playground": "tsx src/cli.ts playground",
     "test": "tsx --test tests/*.test.ts tests/**/*.test.ts",
     "build": "tsc -p tsconfig.json && node scripts/copy-config-templates.mjs",
@@ -21,6 +22,7 @@
     "@mariozechner/pi-agent-core": "^0.57.1",
     "@mariozechner/pi-ai": "^0.57.1",
     "dotenv": "^16.6.1",
+    "telegraf": "^4.16.3",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
