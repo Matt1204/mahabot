@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 
-import { extractTextForHuman } from "../../src/agent/mappers/message.mapper.ts";
+import {
+  extractTextForHuman,
+  toAgentMessages,
+} from "../../src/agent/mappers/message.mapper.ts";
 
 describe("extractTextForHuman", () => {
   test("prefers text blocks when text exists", () => {
@@ -50,5 +56,87 @@ describe("extractTextForHuman", () => {
     } as any;
 
     assert.equal(extractTextForHuman(message), "[agent] Assistant returned no text.");
+  });
+});
+
+describe("toAgentMessages", () => {
+  test("maps local image file parts to base64 image blocks with caption", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mahabot-message-mapper-"));
+    const imagePath = join(root, "photo.jpg");
+
+    try {
+      await writeFile(imagePath, Buffer.from("fake-image-bytes"));
+
+      const messages = await toAgentMessages(
+        {
+          id: "in_1",
+          channel: "telegram",
+          chatId: "1001",
+          userId: "2002",
+          text: "这是什么？",
+          parts: [
+            {
+              type: "image",
+              source: "local_file",
+              path: imagePath,
+              mimeType: "image/jpeg",
+              caption: "菜单",
+            },
+            {
+              type: "text",
+              text: "这是什么？",
+              origin: "telegram_text",
+            },
+          ],
+          timestamp: 123,
+        },
+        { shortTermMessages: [] },
+        { supportsImageInput: true }
+      );
+
+      const userMessage = messages[0] as any;
+      assert.equal(userMessage.role, "user");
+      assert.deepEqual(userMessage.content[0], {
+        type: "text",
+        text: "Image caption: 菜单",
+      });
+      assert.equal(userMessage.content[1].type, "image");
+      assert.equal(userMessage.content[1].mimeType, "image/jpeg");
+      assert.equal(userMessage.content[1].sourcePath, imagePath);
+      assert.equal(userMessage.content[1].data, Buffer.from("fake-image-bytes").toString("base64"));
+      assert.deepEqual(userMessage.content[2], {
+        type: "text",
+        text: "这是什么？",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects image parts when active model is text-only", async () => {
+    await assert.rejects(
+      () =>
+        toAgentMessages(
+          {
+            id: "in_1",
+            channel: "telegram",
+            chatId: "1001",
+            userId: "2002",
+            text: "[image]",
+            parts: [
+              {
+                type: "image",
+                source: "local_file",
+                path: "/tmp/photo.jpg",
+                mimeType: "image/jpeg",
+              },
+            ],
+            timestamp: 123,
+          },
+          { shortTermMessages: [] },
+          { supportsImageInput: false }
+        ),
+      /Current model does not support image input/
+    );
   });
 });

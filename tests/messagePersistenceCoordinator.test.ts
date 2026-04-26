@@ -7,7 +7,7 @@ import { describe, test } from "node:test";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
 import { MessagePersistenceCoordinator } from "../src/agent/persistence/messagePersistenceCoordinator.ts";
-import { JsonlMessageStore } from "../src/agent/persistence/jsonlMessageStore.ts";
+import { SqliteMessageStore } from "../src/agent/persistence/sqliteMessageStore.ts";
 
 function message(role: "user" | "assistant", text: string, timestamp: number): AgentMessage {
   return {
@@ -18,15 +18,70 @@ function message(role: "user" | "assistant", text: string, timestamp: number): A
 }
 
 describe("MessagePersistenceCoordinator", () => {
-  test("restores aligned startup window, persists pending tail, and compacts by token watermark", async () => {
-    const root = await mkdtemp(join(tmpdir(), "message-persistence-coordinator-test-"));
-    const sessionJsonlPath = join(root, "session.jsonl");
+  test("persists image blocks with base64 intact so restored context shape is unchanged", async () => {
+    const root = await mkdtemp(join(tmpdir(), "message-persistence-coordinator-image-test-"));
+    const sessionDbPath = join(root, "session.sqlite");
 
     try {
       const config = {
         enabled: true,
         sessionId: "session-1",
-        sessionJsonlPath,
+        sessionDbPath,
+        startupRestoreMessageCount: 10,
+        compactHighWatermarkTokens: 100,
+        compactLowWatermarkTokens: 40,
+      };
+      const coordinator = new MessagePersistenceCoordinator(config);
+      const imageMessage = {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            data: "base64-data",
+            mimeType: "image/jpeg",
+            sourcePath: "/tmp/photo.jpg",
+          },
+          {
+            type: "text",
+            text: "这是什么？",
+          },
+        ],
+        timestamp: 123,
+      } as unknown as AgentMessage;
+
+      const persisted = await coordinator.persistPendingMessages([imageMessage]);
+      assert.equal(persisted.persistedCount, 1);
+
+      const store = new SqliteMessageStore({
+        sessionId: "session-1",
+        sessionDbPath,
+      });
+      const records = await store.readAll();
+      assert.equal(records.length, 1);
+
+      const content = (records[0]!.message as any).content;
+      assert.equal(content[0].type, "image");
+      assert.equal(content[0].data, "base64-data");
+      assert.equal(content[0].mimeType, "image/jpeg");
+      assert.equal(content[0].sourcePath, "/tmp/photo.jpg");
+      assert.deepEqual(content[1], {
+        type: "text",
+        text: "这是什么？",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores aligned startup window, persists pending tail, and compacts by token watermark", async () => {
+    const root = await mkdtemp(join(tmpdir(), "message-persistence-coordinator-test-"));
+    const sessionDbPath = join(root, "session.sqlite");
+
+    try {
+      const config = {
+        enabled: true,
+        sessionId: "session-1",
+        sessionDbPath,
         startupRestoreMessageCount: 2,
         compactHighWatermarkTokens: 100,
         compactLowWatermarkTokens: 40,
@@ -72,9 +127,9 @@ describe("MessagePersistenceCoordinator", () => {
       assert.equal(flushAfterCompact.persistedCount, 0);
       assert.equal(flushAfterCompact.persistedCursor, 2);
 
-      const store = new JsonlMessageStore({
+      const store = new SqliteMessageStore({
         sessionId: "session-1",
-        sessionJsonlPath,
+        sessionDbPath,
       });
       const allRecords = await store.readAll();
       assert.equal(allRecords.length, 8);

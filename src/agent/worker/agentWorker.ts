@@ -1,5 +1,5 @@
 import type { Agent } from "../agent.js";
-import type { MessageBus, UserToAgentPart } from "../../messageBus/types.js";
+import type { BusEnvelope, MessageBus, UserToAgentPayload } from "../../messageBus/types.js";
 import { createBusMessageId } from "../../messageBus/id.js";
 
 export interface AgentWorkerOptions {
@@ -71,7 +71,7 @@ export class AgentWorker {
           break;
         }
 
-        await this.handleUserEnvelope(userEnvelope.payload.parts);
+        await this.handleUserEnvelope(userEnvelope);
       } catch (error) {
         if (isAbortError(error)) {
           break;
@@ -82,11 +82,18 @@ export class AgentWorker {
     }
   }
 
-  private async handleUserEnvelope(parts: UserToAgentPart[]): Promise<void> {
-    const cliText = toCliText(parts);
+  private async handleUserEnvelope(
+    envelope: BusEnvelope<UserToAgentPayload>
+  ): Promise<void> {
     try {
       // Invoke Agent loop !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-      const result = await this.agent.runCliTurn(cliText, this.channelType, this.chatId, this.userId);
+      const result = await this.agent.runUserTurn({
+        parts: envelope.payload.parts,
+        channel: this.channelType,
+        chatId: this.chatId,
+        userId: this.userId,
+        metadata: envelope.meta,
+      });
 
       // publish assistant message to MessageBus
       this.bus.publish({
@@ -126,24 +133,6 @@ export class AgentWorker {
       });
     }
   }
-}
-
-function toCliText(parts: UserToAgentPart[]): string {
-  const lines: string[] = [];
-
-  for (const part of parts) {
-    if (part.type === "text") {
-      lines.push(part.text);
-      continue;
-    }
-
-    // We keep image payload in-band for now as a textual placeholder.
-    // This allows current text-based agent path to preserve image context until
-    // full multimodal inbound mapping is introduced.
-    lines.push(`[image] ${part.url}`);
-  }
-
-  return lines.join("\n").trim();
 }
 
 function isAbortError(error: unknown): boolean {

@@ -1,5 +1,5 @@
 import { createBusMessageId } from "../../messageBus/id.js";
-import type { MessageBus } from "../../messageBus/types.js";
+import type { MessageBus, UserToAgentPart } from "../../messageBus/types.js";
 
 export interface PublishTelegramUserMessageInput {
   bus: MessageBus;
@@ -13,14 +13,44 @@ export interface PublishTelegramUserMessageInput {
   now?: () => number;
 }
 
+export interface PublishTelegramUserPartsInput {
+  bus: MessageBus;
+  sessionId: string;
+  parts: UserToAgentPart[];
+  chatId: string;
+  userId: string;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  voice?: {
+    transcriptModel: string;
+    duration?: number;
+    mimeType?: string;
+    fileSize?: number;
+  };
+  now?: () => number;
+}
+
 /**
  * Converts Telegram text input into a normalized user_to_agent envelope.
  * Returns true when one envelope was published; false when input is empty after trim.
  */
 export function publishTelegramUserMessage(input: PublishTelegramUserMessageInput): boolean {
-  const now = input.now ?? (() => Date.now());
   const trimmed = input.text.trim();
   if (!trimmed) {
+    return false;
+  }
+
+  return publishTelegramUserParts({
+    ...input,
+    parts: [{ type: "text", text: trimmed, origin: "telegram_text" }],
+  });
+}
+
+export function publishTelegramUserParts(input: PublishTelegramUserPartsInput): boolean {
+  const now = input.now ?? (() => Date.now());
+  const parts = normalizeParts(input.parts);
+  if (parts.length === 0) {
     return false;
   }
 
@@ -33,22 +63,50 @@ export function publishTelegramUserMessage(input: PublishTelegramUserMessageInpu
     kind: "ui.user_message",
     priority: "high",
     payload: {
-      parts: [{ type: "text", text: trimmed }],
+      parts,
     },
     renderHints: {
       style: "primary",
       prefix: "you",
     },
-    meta: {
-      telegram: {
-        chatId: input.chatId,
-        userId: input.userId,
-        username: input.username,
-        firstName: input.firstName,
-        lastName: input.lastName,
-      },
-    },
+    meta: buildTelegramMeta(input),
   });
 
   return true;
+}
+
+function buildTelegramMeta(input: PublishTelegramUserPartsInput): Record<string, unknown> {
+  const meta: Record<string, unknown> = {
+    telegram: {
+      chatId: input.chatId,
+      userId: input.userId,
+      username: input.username,
+      firstName: input.firstName,
+      lastName: input.lastName,
+    },
+  };
+
+  if (input.voice) {
+    meta.voice = input.voice;
+  }
+
+  return meta;
+}
+
+function normalizeParts(parts: UserToAgentPart[]): UserToAgentPart[] {
+  const normalized: UserToAgentPart[] = [];
+
+  for (const part of parts) {
+    if (part.type === "text") {
+      const text = part.text.trim();
+      if (text) {
+        normalized.push({ ...part, text });
+      }
+      continue;
+    }
+
+    normalized.push(part);
+  }
+
+  return normalized;
 }

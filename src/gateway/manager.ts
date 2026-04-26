@@ -13,9 +13,17 @@ import { createCliRenderer } from "./egress/cliRenderer.js";
 import { createTelegramEgressRelay } from "./egress/telegramEgressAdapter.js";
 import { publishCliUserMessage } from "./ingress/cliIngressAdapter.js";
 import { evaluateTelegramIngress } from "./ingress/telegramAccessPolicy.js";
-import { publishTelegramUserMessage } from "./ingress/telegramIngressAdapter.js";
+import { publishTelegramUserParts } from "./ingress/telegramIngressAdapter.js";
+import { TelegramMediaStore } from "./ingress/telegramMediaStore.js";
+import { TelegramPendingImageBuffer } from "./ingress/telegramPendingImageBuffer.js";
 import { resolveTelegramRuntimeConfig } from "./ingress/telegramRuntimeConfig.js";
-import { InMemoryMessageBus, createBusMessageId, type MessageBus } from "../messageBus/index.js";
+import { TelegramVoiceTranscriber } from "./ingress/telegramVoiceTranscriber.js";
+import {
+  InMemoryMessageBus,
+  createBusMessageId,
+  type MessageBus,
+  type UserToAgentPart,
+} from "../messageBus/index.js";
 
 const CLI_WORKSPACE_SESSION_ID = "cli-stable-session";
 const TELEGRAM_WORKSPACE_SESSION_ID = "telegram-stable-session";
@@ -29,6 +37,16 @@ interface WorkerBinding {
   channel: "cli" | "telegram";
   chatId: string;
   userId: string;
+}
+
+interface TelegramSessionRuntime extends SessionRuntime {
+  sessionId: string;
+  chatId: string;
+  userId: string;
+  stopTelegramRelay: () => void;
+  mediaStore: TelegramMediaStore;
+  pendingImages: TelegramPendingImageBuffer;
+  voiceTranscriber: TelegramVoiceTranscriber;
 }
 
 /**
@@ -177,10 +195,8 @@ export class MahabotGatewayManager {
 
     const bot = new Telegraf(telegramConfig.botToken);
     let activeChatId: string | null = null;
-    let activeRuntime:
-      | (SessionRuntime & { sessionId: string; chatId: string; stopTelegramRelay: () => void })
-      | null = null;
-    let activationPromise: Promise<void> | null = null;
+    let activeRuntime: TelegramSessionRuntime | null = null;
+    let messageQueue: Promise<void> = Promise.resolve();
 
     let resolveStopSignal: (() => void) | null = null;
     const stopSignal = new Promise<void>((resolve) => {
@@ -204,6 +220,7 @@ export class MahabotGatewayManager {
         await activeRuntime.worker.stop();
         await activeRuntime.agent.stop();
         activeRuntime.stopTelegramRelay();
+        activeRuntime.pendingImages.stop();
         activeRuntime = null;
       }
 
@@ -223,21 +240,86 @@ export class MahabotGatewayManager {
       console.warn(`[telegram] unhandled middleware error: ${String(error)}`);
     });
 
-    bot.on("message", async (ctx) => {
+    const activateRuntime = async (chatId: string, userId: string): Promise<TelegramSessionRuntime | null> => {
+      if (activeRuntime) {
+        return activeRuntime;
+      }
+
+      const sessionId = `tg:${chatId}`;
+      const runtime = await this.buildSessionRuntime(
+        sessionId,
+        bootstrap.sessionRoot,
+        bootstrap.workspaceRoot,
+        bootstrap.persistenceRoot,
+        bus,
+        {
+          channel: "telegram",
+          chatId,
+          userId,
+        }
+      );
+
+      if (shuttingDown) {
+        await runtime.agent.stop();
+        return null;
+      }
+
+      runtime.worker.start();
+      const stopTelegramRelay = createTelegramEgressRelay({
+        bus,
+        sessionId,
+        chatId,
+        client: {
+          sendMessage: (targetChatId, text, options) =>
+            bot.telegram.sendMessage(targetChatId, text, options),
+        },
+        logger: {
+          warn: console.warn,
+        },
+      });
+
+      activeChatId = chatId;
+      activeRuntime = {
+        ...runtime,
+        sessionId,
+        chatId,
+        userId,
+        stopTelegramRelay,
+        mediaStore: new TelegramMediaStore({
+          persistenceRoot: bootstrap.persistenceRoot,
+          sessionId,
+          telegram: {
+            getFileLink: (fileId) => bot.telegram.getFileLink(fileId),
+          },
+        }),
+        pendingImages: new TelegramPendingImageBuffer({
+          timeoutMs: telegramConfig.media.pendingImageTimeoutMs,
+        }),
+        voiceTranscriber: new TelegramVoiceTranscriber({
+          ffmpegCommand: telegramConfig.media.ffmpegCommand,
+          transcription: telegramConfig.media.transcription,
+        }),
+      };
+
+      this.io.output.write(`[telegram] active chat set to ${chatId}, session ${sessionId}\n`);
+      return activeRuntime;
+    };
+
+    const handleTelegramMessage = async (ctx: any): Promise<void> => {
       if (shuttingDown) {
         return;
       }
 
-      if (!ctx.chat || !ctx.from || !ctx.message || !("text" in ctx.message)) {
+      if (!ctx.chat || !ctx.from || !ctx.message) {
         return;
       }
 
       const chatId = String(ctx.chat.id);
       const userId = String(ctx.from.id);
-      const messageText = ctx.message.text;
+      const messageKind = getTelegramMessageKind(ctx.message);
 
       if (ctx.chat.type !== "private") {
-        await ctx.reply("This bot currently supports private text chats only.");
+        await ctx.reply("This bot currently supports private text, voice, and photo chats only.");
         return;
       }
 
@@ -258,66 +340,17 @@ export class MahabotGatewayManager {
         return;
       }
 
+      if (!messageKind) {
+        await ctx.reply("Unsupported message type. Send text, voice, or photo.");
+        return;
+      }
+
       if (decision.type === "accept_activate") {
-        const sessionId = `tg:${chatId}`;
-        activeChatId = chatId;
-
-        activationPromise = (async () => {
-          const runtime = await this.buildSessionRuntime(
-            sessionId,
-            bootstrap.sessionRoot,
-            bootstrap.workspaceRoot,
-            bootstrap.persistenceRoot,
-            bus,
-            {
-              channel: "telegram",
-              chatId,
-              userId,
-            }
-          );
-          if (shuttingDown) {
-            await runtime.agent.stop();
-            return;
-          }
-          runtime.worker.start();
-          const stopTelegramRelay = createTelegramEgressRelay({
-            bus,
-            sessionId,
-            chatId,
-            client: {
-              sendMessage: (targetChatId, text) => bot.telegram.sendMessage(targetChatId, text),
-            },
-            logger: {
-              warn: console.warn,
-            },
-          });
-
-          activeRuntime = {
-            ...runtime,
-            sessionId,
-            chatId,
-            stopTelegramRelay,
-          };
-
-          this.io.output.write(`[telegram] active chat set to ${chatId}, session ${sessionId}\n`);
-        })();
-
         try {
-          await activationPromise;
+          await activateRuntime(chatId, userId);
         } catch (error) {
           activeChatId = null;
           activeRuntime = null;
-          await ctx.reply(`bot> [error] ${String(error)}`);
-          return;
-        } finally {
-          activationPromise = null;
-        }
-      }
-
-      if (activationPromise) {
-        try {
-          await activationPromise;
-        } catch (error) {
           await ctx.reply(`bot> [error] ${String(error)}`);
           return;
         }
@@ -328,16 +361,66 @@ export class MahabotGatewayManager {
         return;
       }
 
-      publishTelegramUserMessage({
+      if (messageKind === "photo") {
+        const expired = activeRuntime.pendingImages.clearExpired(activeRuntime.sessionId);
+        if (expired?.type === "expired") {
+          await activeRuntime.mediaStore.deleteFiles(expired.expiredImages.map((image) => image.path));
+          await ctx.reply("Previous pending images expired. Please resend images you still want to include.");
+        }
+
+        try {
+          const image = await activeRuntime.mediaStore.savePhoto(ctx.message);
+          activeRuntime.pendingImages.addImage(activeRuntime.sessionId, image);
+          await ctx.reply("Image received. Send a text or voice message to submit it.");
+        } catch (error) {
+          await ctx.reply(`bot> [error] failed to save image: ${errorMessage(error)}`);
+        }
+        return;
+      }
+
+      if (messageKind === "voice") {
+        try {
+          const voice = await activeRuntime.mediaStore.saveVoiceTemp(ctx.message);
+          const transcription = await activeRuntime.voiceTranscriber.transcribe(voice);
+          await publishTriggeredTelegramMessage({
+            runtime: activeRuntime,
+            bus,
+            ctx,
+            text: transcription.text,
+            origin: "telegram_voice_transcript",
+            voice: {
+              transcriptModel: transcription.model,
+              duration: transcription.duration,
+              mimeType: transcription.mimeType,
+              fileSize: transcription.fileSize,
+            },
+          });
+        } catch (error) {
+          await ctx.reply(`bot> [error] failed to transcribe voice: ${errorMessage(error)}`);
+        }
+        return;
+      }
+
+      const text = String(ctx.message.text).trim();
+      if (!text) {
+        return;
+      }
+
+      await publishTriggeredTelegramMessage({
+        runtime: activeRuntime,
         bus,
-        sessionId: activeRuntime.sessionId,
-        text: messageText,
-        chatId,
-        userId,
-        username: ctx.from?.username,
-        firstName: ctx.from?.first_name,
-        lastName: ctx.from?.last_name,
+        ctx,
+        text,
+        origin: "telegram_text",
       });
+    };
+
+    bot.on("message", (ctx) => {
+      messageQueue = messageQueue
+        .then(() => handleTelegramMessage(ctx))
+        .catch((error) => {
+          console.warn(`[telegram] failed to handle message: ${String(error)}`);
+        });
     });
 
     this.io.output.write("mahabot Telegram mode starting...\n");
@@ -445,7 +528,7 @@ export class MahabotGatewayManager {
         messagePersistence: {
           enabled: true,
           sessionId,
-          sessionJsonlPath: resolve(persistenceRoot, "session.jsonl"),
+          sessionDbPath: resolve(persistenceRoot, "session.sqlite"),
           startupRestoreMessageCount: appConfig.agent.startupRestoreMessageCount,
           compactHighWatermarkTokens: appConfig.agent.compactHighWatermarkTokens,
           compactLowWatermarkTokens: appConfig.agent.compactLowWatermarkTokens,
@@ -479,6 +562,70 @@ function isExitCommand(line: string): boolean {
     normalized === "/exit" ||
     normalized === ":q"
   );
+}
+
+function getTelegramMessageKind(message: unknown): "text" | "photo" | "voice" | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+
+  const value = message as Record<string, unknown>;
+  if (typeof value.text === "string") {
+    return "text";
+  }
+  if (Array.isArray(value.photo) && value.photo.length > 0) {
+    return "photo";
+  }
+  if (value.voice && typeof value.voice === "object") {
+    return "voice";
+  }
+  return null;
+}
+
+async function publishTriggeredTelegramMessage(input: {
+  runtime: TelegramSessionRuntime;
+  bus: MessageBus;
+  ctx: any;
+  text: string;
+  origin: "telegram_text" | "telegram_voice_transcript";
+  voice?: {
+    transcriptModel: string;
+    duration?: number;
+    mimeType?: string;
+    fileSize?: number;
+  };
+}): Promise<void> {
+  const parts: UserToAgentPart[] = [];
+  const pending = input.runtime.pendingImages.takeImages(input.runtime.sessionId);
+
+  if (pending.type === "expired") {
+    await input.runtime.mediaStore.deleteFiles(pending.expiredImages.map((image) => image.path));
+    await input.ctx.reply("Pending images expired. Processing your message without them.");
+  } else if (pending.type === "ready") {
+    parts.push(...pending.images);
+  }
+
+  parts.push({
+    type: "text",
+    text: input.text,
+    origin: input.origin,
+  });
+
+  publishTelegramUserParts({
+    bus: input.bus,
+    sessionId: input.runtime.sessionId,
+    parts,
+    chatId: String(input.ctx.chat.id),
+    userId: String(input.ctx.from.id),
+    username: input.ctx.from?.username,
+    firstName: input.ctx.from?.first_name,
+    lastName: input.ctx.from?.last_name,
+    voice: input.voice,
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function helpText(): string {

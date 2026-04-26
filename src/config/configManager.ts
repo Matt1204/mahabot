@@ -78,7 +78,7 @@ export class ConfigManager {
     await copyFileIfMissing(userTemplatePath, resolve(workspaceRoot, "USER.md"));
 
     await writeFileIfMissing(resolve(persistenceRoot, "history.md"), "");
-    await writeFileIfMissing(resolve(persistenceRoot, "session.jsonl"), "");
+    await writeFileIfMissing(resolve(persistenceRoot, ".keep"), "");
 
     this.setPath(configPath);
 
@@ -706,6 +706,46 @@ function validateIngressConfig(value: AppConfig["ingress"]): asserts value is Ap
     }
     return normalized;
   });
+
+  if (!isRecord(telegram.media)) {
+    throw new Error("Invalid config: ingress.telegram.media must be an object.");
+  }
+
+  const media = telegram.media as Record<string, unknown>;
+  if (
+    !Number.isInteger(media.pendingImageTimeoutMs) ||
+    (media.pendingImageTimeoutMs as number) < 1000
+  ) {
+    throw new Error("Invalid config: ingress.telegram.media.pendingImageTimeoutMs must be an integer >= 1000.");
+  }
+
+  if (typeof media.ffmpegCommand !== "string" || media.ffmpegCommand.trim().length === 0) {
+    throw new Error("Invalid config: ingress.telegram.media.ffmpegCommand must be a non-empty string.");
+  }
+  media.ffmpegCommand = media.ffmpegCommand.trim();
+
+  if (!isRecord(media.transcription)) {
+    throw new Error("Invalid config: ingress.telegram.media.transcription must be an object.");
+  }
+
+  const transcription = media.transcription as Record<string, unknown>;
+  if (typeof transcription.model !== "string" || transcription.model.trim().length === 0) {
+    throw new Error("Invalid config: ingress.telegram.media.transcription.model must be a non-empty string.");
+  }
+  transcription.model = transcription.model.trim();
+
+  if (
+    typeof transcription.apiKeyEnvVar !== "string" ||
+    transcription.apiKeyEnvVar.trim().length === 0
+  ) {
+    throw new Error("Invalid config: ingress.telegram.media.transcription.apiKeyEnvVar must be a non-empty string.");
+  }
+  transcription.apiKeyEnvVar = transcription.apiKeyEnvVar.trim();
+
+  if (typeof transcription.prompt !== "string" || transcription.prompt.trim().length === 0) {
+    throw new Error("Invalid config: ingress.telegram.media.transcription.prompt must be a non-empty string.");
+  }
+  transcription.prompt = transcription.prompt.trim();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

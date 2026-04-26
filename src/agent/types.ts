@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
 import type { AppConfig } from "../config/types.js";
+import type { UserToAgentPart } from "../messageBus/types.js";
 import { ToolRegistry } from "./tools/registry/toolRegistry.js";
 
 export type Channel = "cli" | "telegram" | "unknown";
@@ -11,6 +12,7 @@ export interface InboundMessageTemp {
   chatId: string;
   userId: string;
   text: string;
+  parts: UserToAgentPart[];
   timestamp: number;
   metadata?: Record<string, unknown>;
 }
@@ -60,7 +62,7 @@ export interface AgentFromAppConfigInput {
 export interface MessagePersistenceConfig {
   enabled: boolean;
   sessionId: string;
-  sessionJsonlPath: string;
+  sessionDbPath: string;
   startupRestoreMessageCount: number;
   compactHighWatermarkTokens: number;
   compactLowWatermarkTokens: number;
@@ -80,4 +82,12 @@ export interface CliTurnResult {
   inbound: InboundMessageTemp;
   outbound: OutboundMessageTemp | null;
   cliMessage: string;
+}
+
+export interface UserTurnInput {
+  parts: UserToAgentPart[];
+  channel?: Channel;
+  chatId?: string;
+  userId?: string;
+  metadata?: Record<string, unknown>;
 }

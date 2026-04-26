@@ -61,7 +61,7 @@ export class ContextManager {
           workspaceSessionId,
           workspaceRoot,
           resolve(persistenceRoot, "history.md"),
-          resolve(persistenceRoot, "session.jsonl")
+          resolve(persistenceRoot, "session.sqlite")
         ),
       },
       {
@@ -136,7 +136,7 @@ export class ContextManager {
     workspaceSessionId: string,
     workspaceRoot: string,
     historyPath: string,
-    sessionJsonlPath: string
+    sessionDbPath: string
   ): string {
     const pythonVersion = process.env.PYTHON_VERSION ?? "unavailable";
 
@@ -148,7 +148,7 @@ export class ContextManager {
       `python: ${pythonVersion}`,
       `workspaceRoot: ${workspaceRoot}`,
       `historyPath: ${historyPath} (reserved for conversation transcript persistence)`,
-      `sessionJsonlPath: ${sessionJsonlPath} (reserved for structured turn persistence)`,
+      `sessionDbPath: ${sessionDbPath} (reserved for structured turn persistence)`,
     ].join("\n");
   }
 

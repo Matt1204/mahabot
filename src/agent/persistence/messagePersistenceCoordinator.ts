@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 
 import type { MessagePersistenceConfig } from "../types.js";
-import { JsonlMessageStore } from "./jsonlMessageStore.js";
+import { SqliteMessageStore } from "./sqliteMessageStore.js";
 import { buildAlignedTailWindow, buildStartupRestoreWindow } from "./windowAlignment.js";
 
 interface MessagePersistenceCoordinatorDeps {
@@ -27,7 +27,7 @@ export interface ContextBudgetSnapshot {
 
 export class MessagePersistenceCoordinator {
   private readonly logger: Pick<Console, "warn" | "error">;
-  private readonly store: JsonlMessageStore;
+  private readonly store: SqliteMessageStore;
 
   // Runtime-only cursor over current in-memory runtime messages.
   private persistedCursor = 0;
@@ -38,9 +38,9 @@ export class MessagePersistenceCoordinator {
     deps: MessagePersistenceCoordinatorDeps = {}
   ) {
     this.logger = deps.logger ?? console;
-    this.store = new JsonlMessageStore({
+    this.store = new SqliteMessageStore({
       sessionId: config.sessionId,
-      sessionJsonlPath: config.sessionJsonlPath,
+      sessionDbPath: config.sessionDbPath,
     }, {
       logger: this.logger,
     });

@@ -4,7 +4,16 @@
     "telegram": {
       "enabled": true,
       "botTokenEnvVar": "TELEGRAM_BOT_TOKEN",
-      "allowedChatIds": ["7346503136"]
+      "allowedChatIds": ["7346503136"],
+      "media": {
+        "pendingImageTimeoutMs": 600000,
+        "ffmpegCommand": "ffmpeg",
+        "transcription": {
+          "model": "gpt-4o-mini-transcribe",
+          "apiKeyEnvVar": "OPENAI_API_KEY",
+          "prompt": "The speaker is chatting with mahabot. The conversation is usually in Chinese. Transcribe the user's words accurately and keep the original language."
+        }
+      }
     }
   },
   "agent": {
