@@ -14,6 +14,7 @@ export interface EventInspectionDeps {
   publishStatus: AgentRuntimeStatusPublisher;
   logger?: Pick<Console, "debug" | "warn" | "error">;
   getContextWatermarks?: () => ContextWatermarks | undefined;
+  getInspectionConfig?: () => EventInspectionConfig;
 }
 
 /**
@@ -26,6 +27,7 @@ export class EventInspection {
   private readonly logger: Pick<Console, "debug" | "warn" | "error">;
   private readonly publishStatus: AgentRuntimeStatusPublisher;
   private readonly getContextWatermarks: () => ContextWatermarks | undefined;
+  private readonly getInspectionConfig: () => EventInspectionConfig;
   private lastUsageFingerprint: string | null = null;
   private turnSeq = 0;
   private assistantSeq = 0;
@@ -35,6 +37,7 @@ export class EventInspection {
     this.logger = deps.logger ?? console;
     this.publishStatus = deps.publishStatus;
     this.getContextWatermarks = deps.getContextWatermarks ?? (() => undefined);
+    this.getInspectionConfig = deps.getInspectionConfig ?? (() => this.config);
   }
 
   handleAgentEvent(event: AgentEvent): void {
@@ -44,11 +47,12 @@ export class EventInspection {
 
   private processEvent(event: AgentEvent): void {
     try {
-      this.processThinkingEvent(event);
+      const config = this.getInspectionConfig();
+      this.processThinkingEvent(event, config);
 
-      const includeMainEvent = this.config.useEventInspection && shouldInclude(event.type, this.config);
+      const includeMainEvent = config.useEventInspection && shouldInclude(event.type, config);
       const includeTokenUsage =
-        this.config.useEventInspection && this.config.showTokenUsage && event.type === "turn_end";
+        config.useEventInspection && config.showTokenUsage && event.type === "turn_end";
 
       if (!includeMainEvent && !includeTokenUsage) {
         return;
@@ -115,8 +119,8 @@ export class EventInspection {
     }
   }
 
-  private processThinkingEvent(event: AgentEvent): void {
-    if (!this.config.thinking.enabled) {
+  private processThinkingEvent(event: AgentEvent, config: EventInspectionConfig): void {
+    if (!config.thinking.enabled) {
       return;
     }
 
@@ -140,14 +144,17 @@ export class EventInspection {
         this.activeThinkingByContentIndex.clear();
         return;
       case "message_update":
-        this.handleThinkingUpdate(event);
+        this.handleThinkingUpdate(event, config);
         return;
       default:
         return;
     }
   }
 
-  private handleThinkingUpdate(event: Extract<AgentEvent, { type: "message_update" }>): void {
+  private handleThinkingUpdate(
+    event: Extract<AgentEvent, { type: "message_update" }>,
+    config: EventInspectionConfig
+  ): void {
     const assistantEvent = event.assistantMessageEvent;
 
     switch (assistantEvent.type) {
@@ -164,7 +171,7 @@ export class EventInspection {
           assistantEvent.content ??
           this.activeThinkingByContentIndex.get(assistantEvent.contentIndex) ??
           extractThinkingFromAssistantMessage(event.message, assistantEvent.contentIndex);
-        const thinkingText = normalizeThinkingText(rawThinking, this.config.thinking.maxChars);
+        const thinkingText = normalizeThinkingText(rawThinking, config.thinking.maxChars);
         this.activeThinkingByContentIndex.delete(assistantEvent.contentIndex);
 
         if (!thinkingText) {

@@ -15,6 +15,12 @@ import {
 } from "../onboarding/index.js";
 import { createCliRenderer } from "./egress/cliRenderer.js";
 import { createTelegramEgressRelay } from "./egress/telegramEgressAdapter.js";
+import {
+  RuntimeCommandController,
+  createRuntimeEventInspectionConfig,
+  parseRuntimeCommands,
+  type RuntimeEventInspectionConfig,
+} from "./commands/index.js";
 import { publishCliUserMessage } from "./ingress/cliIngressAdapter.js";
 import { evaluateTelegramIngress } from "./ingress/telegramAccessPolicy.js";
 import { publishTelegramUserParts } from "./ingress/telegramIngressAdapter.js";
@@ -34,6 +40,8 @@ const CLI_WORKSPACE_SESSION_ID = "cli-stable-session";
 interface SessionRuntime {
   agent: Agent;
   worker: AgentWorker;
+  eventInspectionConfig: RuntimeEventInspectionConfig;
+  commandController: RuntimeCommandController;
 }
 
 interface WorkerBinding {
@@ -405,11 +413,28 @@ export class MahabotGatewayManager {
         return;
       }
 
+      const commandParseResult = parseRuntimeCommands(text);
+      for (const unknownCommandText of commandParseResult.unknownCommandTexts) {
+        console.log(`[telegram command] unknown command: ${unknownCommandText}`);
+      }
+
+      if (commandParseResult.commands.length > 0) {
+        const commandResult = activeRuntime.commandController.execute(commandParseResult.commands);
+        for (const reply of commandResult.replies) {
+          await ctx.reply(reply);
+        }
+      }
+
+      const remainingText = commandParseResult.remainingText.trim();
+      if (!remainingText) {
+        return;
+      }
+
       await publishTriggeredTelegramMessage({
         runtime: activeRuntime,
         bus,
         ctx,
-        text,
+        text: remainingText,
         origin: "telegram_text",
       });
     };
@@ -493,8 +518,10 @@ export class MahabotGatewayManager {
       toolRegistry
     );
 
+    const eventInspectionConfig = createRuntimeEventInspectionConfig(appConfig.eventInspection);
     const eventInspection = new EventInspection(appConfig.eventInspection, {
       publishStatus: publishRuntimeStatus,
+      getInspectionConfig: () => eventInspectionConfig.getSnapshot(),
       getContextWatermarks: () => ({
         lowWaterMark: appConfig.agent.compactLowWatermarkTokens,
         highWaterMark: appConfig.agent.compactHighWatermarkTokens,
@@ -557,6 +584,17 @@ export class MahabotGatewayManager {
     return {
       agent,
       worker,
+      eventInspectionConfig,
+      commandController: new RuntimeCommandController({
+        eventInspectionConfig,
+        getContextSnapshot: () => agent.getRuntimeContextSnapshot(),
+        getAgentStateSnapshot: () => ({
+          context: agent.getRuntimeContextSnapshot(),
+          appliedConfig: agent.getAppliedConfigSnapshot(),
+          runtime: agent.getRuntimeLifecycleSnapshot(),
+          toolCount: toolRegistry.getToolNames().length,
+        }),
+      }),
     };
   }
 }

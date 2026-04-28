@@ -14,10 +14,13 @@ import type {
   AgentDependencies,
   AgentFromAppConfigInput,
   AgentRuntimeConfig,
+  AgentRuntimeLifecycleSnapshot,
+  AppliedAgentConfigSnapshot,
   CliTurnResult,
   InboundMessageTemp,
   MemoryBundle,
   OutboundMessageTemp,
+  RuntimeContextSnapshot,
   UserTurnInput,
 } from "./types.js";
 import {
@@ -34,11 +37,19 @@ export class Agent {
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   private readonly onAgentEvent?: (event: AgentEvent) => void;
   private readonly messagePersistenceCoordinator?: MessagePersistenceCoordinator;
+  private readonly appliedConfig: AppliedAgentConfigSnapshot;
+  private readonly persistenceEnabled: boolean;
+  private readonly startupRestoreMessageCount: number;
 
   private running = false;
   private loopAbortController: AbortController | null = null;
   private serialQueue: Promise<void> = Promise.resolve();
   private readonly persistedContextLoadPromise: Promise<void>;
+  private readonly contextWatermarks?: {
+    compactLowWatermarkTokens: number;
+    compactHighWatermarkTokens: number;
+  };
+  private activeTurnCount = 0;
 
   /**
    * Static builder for composing runtime dependencies from app-level config.
@@ -63,6 +74,12 @@ export class Agent {
       thinkingLevel: input.thinkingLevel,
       toolRegistry,
       getApiKey: input.getApiKey,
+      appliedConfig: createAppliedAgentConfigSnapshot(
+        model,
+        input.providerName,
+        input.modelName,
+        input.thinkingLevel
+      ),
     };
 
     // 3. instantiate the agent
@@ -77,10 +94,26 @@ export class Agent {
     this.outboundSink = deps.outboundSink;
     this.memoryAssembler = deps.memoryAssembler;
     this.onAgentEvent = deps.onAgentEvent;
+    this.appliedConfig =
+      agentRuntimeConfig.appliedConfig ??
+      createAppliedAgentConfigSnapshot(
+        agentRuntimeConfig.model,
+        "unknown",
+        "unknown",
+        agentRuntimeConfig.thinkingLevel
+      );
+    this.persistenceEnabled = deps.messagePersistence?.enabled ?? false;
+    this.startupRestoreMessageCount = deps.messagePersistence?.startupRestoreMessageCount ?? 0;
     this.messagePersistenceCoordinator = deps.messagePersistence
       ? new MessagePersistenceCoordinator(deps.messagePersistence, {
           logger: this.logger,
         })
+      : undefined;
+    this.contextWatermarks = deps.messagePersistence
+      ? {
+          compactLowWatermarkTokens: deps.messagePersistence.compactLowWatermarkTokens,
+          compactHighWatermarkTokens: deps.messagePersistence.compactHighWatermarkTokens,
+        }
       : undefined;
 
     // Load persisted context exactly once as part of startup, right after runtime/deps are ready.
@@ -266,6 +299,33 @@ export class Agent {
     });
   }
 
+  getRuntimeContextSnapshot(): RuntimeContextSnapshot {
+    const contextBudget = this.messagePersistenceCoordinator?.getContextBudgetSnapshot();
+    return {
+      curContextSize: contextBudget?.curContextSize ?? 0,
+      compactLowWatermarkTokens:
+        contextBudget?.lowWaterMark ?? this.contextWatermarks?.compactLowWatermarkTokens ?? 0,
+      compactHighWatermarkTokens:
+        contextBudget?.highWaterMark ?? this.contextWatermarks?.compactHighWatermarkTokens ?? 0,
+      runtimeMessageCount: this.agentRuntime.state.messages.length,
+      agentBusy: this.activeTurnCount > 0,
+    };
+  }
+
+  getAppliedConfigSnapshot(): AppliedAgentConfigSnapshot {
+    return { ...this.appliedConfig };
+  }
+
+  getRuntimeLifecycleSnapshot(): AgentRuntimeLifecycleSnapshot {
+    return {
+      running: this.running,
+      agentBusy: this.activeTurnCount > 0,
+      runtimeMessageCount: this.agentRuntime.state.messages.length,
+      persistenceEnabled: this.persistenceEnabled,
+      startupRestoreMessageCount: this.startupRestoreMessageCount,
+    };
+  }
+
   wrapToInboundMessageTemp(
     cliMsg: string,
     channel: InboundMessageTemp["channel"] = "cli",
@@ -280,21 +340,25 @@ export class Agent {
   }
 
   private async executeInboundTurn(inbound: InboundMessageTemp): Promise<CliTurnResult> {
-    const llmMessages = await this.processInboundMessage(inbound);
-    const assistantMessage = await this.invokeAgentLoop(llmMessages);
-    const outbound = await this.parseAgentResponse(assistantMessage, inbound);
-    await this.sendOutboundMessage(outbound);
+    this.activeTurnCount += 1;
+    try {
+      const llmMessages = await this.processInboundMessage(inbound);
+      const assistantMessage = await this.invokeAgentLoop(llmMessages);
+      const outbound = await this.parseAgentResponse(assistantMessage, inbound);
+      await this.sendOutboundMessage(outbound);
 
-    return {
-      inbound,
-      outbound,
-      cliMessage: this.parseToMsgForCliTemp(outbound),
-    };
+      return {
+        inbound,
+        outbound,
+        cliMessage: this.parseToMsgForCliTemp(outbound),
+      };
+    } finally {
+      this.activeTurnCount = Math.max(0, this.activeTurnCount - 1);
+    }
   }
 
   private supportsImageInput(): boolean {
-    const modelInput = (this.agentRuntime.state.model as { input?: unknown }).input;
-    return Array.isArray(modelInput) && modelInput.includes("image");
+    return modelSupportsImageInput(this.agentRuntime.state.model);
   }
 
   injectSteering(cliMsg: string): void {
@@ -399,4 +463,43 @@ function attachContextBudget(
     ...event,
     contextBudget,
   } as AgentEvent;
+}
+
+function createAppliedAgentConfigSnapshot(
+  model: unknown,
+  fallbackProviderName: string,
+  fallbackModelName: string,
+  thinkingLevel: AppliedAgentConfigSnapshot["thinkingLevel"]
+): AppliedAgentConfigSnapshot {
+  const modelRecord = isRecord(model) ? model : {};
+  const modelProvider = toNonEmptyString(modelRecord.provider) ?? fallbackProviderName;
+  const modelId = toNonEmptyString(modelRecord.id) ?? fallbackModelName;
+  const modelDisplayName = toNonEmptyString(modelRecord.name) ?? modelId;
+
+  return {
+    providerName: modelProvider,
+    modelName: modelId,
+    modelProvider,
+    modelId,
+    modelDisplayName,
+    thinkingLevel,
+    supportsImageInput: modelSupportsImageInput(model),
+  };
+}
+
+function modelSupportsImageInput(model: unknown): boolean {
+  const modelInput = isRecord(model) ? model.input : undefined;
+  return Array.isArray(modelInput) && modelInput.includes("image");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function toNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
