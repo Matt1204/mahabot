@@ -5,7 +5,7 @@ import { SqliteMessageStore } from "./sqliteMessageStore.js";
 import { buildAlignedTailWindow, buildStartupRestoreWindow } from "./windowAlignment.js";
 
 interface MessagePersistenceCoordinatorDeps {
-  logger?: Pick<Console, "warn" | "error">;
+  logger?: Pick<Console, "debug" | "info" | "warn" | "error">;
 }
 
 interface CompactResult {
@@ -26,7 +26,7 @@ export interface ContextBudgetSnapshot {
 }
 
 export class MessagePersistenceCoordinator {
-  private readonly logger: Pick<Console, "warn" | "error">;
+  private readonly logger: Pick<Console, "debug" | "info" | "warn" | "error">;
   private readonly store: SqliteMessageStore;
 
   // Runtime-only cursor over current in-memory runtime messages.
@@ -60,15 +60,40 @@ export class MessagePersistenceCoordinator {
     }
 
     try {
+      const start = Date.now();
       const records = await this.store.readAll();
       const restored = buildStartupRestoreWindow(
         records.map((record) => record.message),
         this.config.startupRestoreMessageCount
       );
       this.persistedCursor = restored.length;
+      this.logger.info?.({
+        category: "persistence",
+        event: "persistence.msg_restore_complete",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "message persistence window restored",
+        data: {
+          storePath: this.config.sessionDbPath,
+          readRows: records.length,
+          restoredMessages: restored.length,
+          persistedCursor: this.persistedCursor,
+          durationMs: Date.now() - start,
+        },
+      } as any);
       return { messages: restored, persistedCursor: this.persistedCursor };
     } catch (error) {
-      this.logger.warn(`[message persistence] restore failed, starting without history: ${String(error)}`);
+      this.logger.warn({
+        category: "persistence",
+        event: "persistence.msg_restore_failed",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "message persistence restore failed, starting without history",
+        data: {
+          storePath: this.config.sessionDbPath,
+        },
+        error,
+      } as any);
       this.persistedCursor = 0;
       return { messages: currentMessages, persistedCursor: this.persistedCursor };
     }
@@ -99,6 +124,19 @@ export class MessagePersistenceCoordinator {
 
     // const this.curContextSize = this.curContextSize;
     if (this.curContextSize < this.config.compactHighWatermarkTokens) {
+      this.logger.debug?.({
+        category: "context",
+        event: "context.compact_skipped",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "context compaction skipped below high watermark",
+        data: {
+          reason: "below_high_watermark",
+          curContextSize: this.curContextSize,
+          highWatermark: this.config.compactHighWatermarkTokens,
+          messageCount: messages.length,
+        },
+      } as any);
       return { didCompact: false, messages, persistedCursor: this.persistedCursor };
     }
     if (messages.length === 0) {
@@ -109,6 +147,20 @@ export class MessagePersistenceCoordinator {
     const targetKeepApprox: number = Math.ceil(messages.length * ratio);
     const targetKeep: number = clamp(targetKeepApprox, 1, messages.length);
     const compactedMessages = buildAlignedTailWindow(messages, targetKeep);
+    this.logger.info?.({
+      category: "context",
+      event: "context.compact_triggered",
+      component: "MessagePersistenceCoordinator",
+      sessionId: this.config.sessionId,
+      summary: "context compaction triggered",
+      data: {
+        curContextSize: this.curContextSize,
+        lowWatermark: this.config.compactLowWatermarkTokens,
+        highWatermark: this.config.compactHighWatermarkTokens,
+        beforeCount: messages.length,
+        targetKeep,
+      },
+    } as any);
 
     if (compactedMessages.length === 0 || compactedMessages.length >= messages.length) {
       return { didCompact: false, messages, persistedCursor: this.persistedCursor };
@@ -117,6 +169,17 @@ export class MessagePersistenceCoordinator {
     // Persist first so compaction never drops unpersisted messages.
     const persistResult = await this.persistPendingMessages(messages);
     if (persistResult.persistedCursor !== messages.length) {
+      this.logger.warn?.({
+        category: "context",
+        event: "context.compact_blocked",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "context compaction blocked because pending messages were not fully persisted",
+        data: {
+          persistedCursor: persistResult.persistedCursor,
+          messageCount: messages.length,
+        },
+      } as any);
       return { didCompact: false, messages, persistedCursor: this.persistedCursor };
     }
 
@@ -145,11 +208,50 @@ export class MessagePersistenceCoordinator {
     }
 
     try {
+      const start = Date.now();
+      this.logger.debug?.({
+        category: "persistence",
+        event: "persistence.msg_append_start",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "message append started",
+        data: {
+          pendingCount: pendingMessages.length,
+          boundedCursor,
+          runtimeMessageCount: messages.length,
+          storePath: this.config.sessionDbPath,
+        },
+      } as any);
       const persistedCount = await this.store.appendMessages(pendingMessages);
       this.persistedCursor = boundedCursor + persistedCount;
+      this.logger.info?.({
+        category: "persistence",
+        event: "persistence.msg_append_complete",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "message append completed",
+        data: {
+          persistedCount,
+          persistedCursor: this.persistedCursor,
+          durationMs: Date.now() - start,
+          storePath: this.config.sessionDbPath,
+        },
+      } as any);
       return { persistedCount, persistedCursor: this.persistedCursor };
     } catch (error) {
-      this.logger.error(`[message persistence] append failed: ${String(error)}`);
+      this.logger.error({
+        category: "persistence",
+        event: "persistence.msg_append_failed",
+        component: "MessagePersistenceCoordinator",
+        sessionId: this.config.sessionId,
+        summary: "message append failed",
+        data: {
+          pendingCount: pendingMessages.length,
+          boundedCursor,
+          storePath: this.config.sessionDbPath,
+        },
+        error,
+      } as any);
       this.persistedCursor = boundedCursor;
       return { persistedCount: 0, persistedCursor: this.persistedCursor };
     }

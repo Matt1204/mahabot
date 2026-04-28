@@ -182,6 +182,26 @@ describe("config slimming validation", () => {
       /ingress\.telegram\.media\.pendingImageTimeoutMs/
     );
   });
+
+  test("validates logging config", () => {
+    const manager = new ConfigManager();
+    const config = cloneConfig();
+    config.logging.level = "debug";
+    config.logging.path = " logs/test.ndjson ";
+    config.logging.maxEntries = 500;
+
+    const normalized = manager.set(config);
+    assert.equal(normalized.logging.level, "debug");
+    assert.equal(normalized.logging.path, "logs/test.ndjson");
+    assert.equal(normalized.logging.maxEntries, 500);
+
+    const invalid = cloneConfig() as any;
+    invalid.logging.maxEntries = 10;
+    assert.throws(
+      () => manager.set(invalid),
+      /logging\.maxEntries/
+    );
+  });
 });
 
 describe("modelFactory fallback order", () => {

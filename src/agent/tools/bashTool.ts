@@ -7,6 +7,7 @@ import { Type } from "@mariozechner/pi-ai";
 
 import type { DescribedAgentTool } from "./registry/types.js";
 import { textResult } from "./showcase/shared.js";
+import type { Logger } from "../../logging/index.js";
 
 const DEFAULT_BASH_TIMEOUT_MS = 60_000;
 const MIN_BASH_TIMEOUT_MS = 1_000;
@@ -48,6 +49,7 @@ const HIGH_RISK_UNVERIFIABLE_PATTERNS: RegExp[] = [
 interface CreateBashToolInput {
   workspaceRoot: string;
   restrictToWorkspace: boolean;
+  logger?: Logger;
 }
 
 interface BashToolResult {
@@ -92,6 +94,7 @@ function debugLog(stage: string, payload: Record<string, unknown>): void {
 export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
   const workspaceRoot = resolve(input.workspaceRoot);
   const restrictToWorkspace = input.restrictToWorkspace;
+  const logger = input.logger;
 
   const bashToolSchema = Type.Object({
     command: Type.String({ minLength: 1 }),
@@ -139,6 +142,17 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       });
 
       if (timeoutMs === null) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_blocked",
+          component: "bashTool",
+          summary: "bash command blocked by invalid timeout",
+          data: {
+            toolCallId,
+            blockedReason: "invalid_timeout_ms",
+            timeoutMs: params.timeoutMs,
+          },
+        } as any);
         return textResult(
           [
             "Bash command blocked by policy:",
@@ -172,6 +186,16 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
           toolCallId,
           workspaceRoot: workspaceRootCanonical,
         });
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_blocked",
+          component: "bashTool",
+          summary: "bash command blocked by policy",
+          data: {
+            toolCallId,
+            blockedReason: "empty_command",
+          },
+        } as any);
         return blockedResult(
           toolDescription,
           command,
@@ -198,6 +222,18 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
           effectiveWorkingDir: effectiveWorkingDirCanonical,
           commandPreview: truncateForDebug(normalizedCommand),
         });
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_blocked",
+          component: "bashTool",
+          summary: "bash command blocked by command policy",
+          data: {
+            toolCallId,
+            blockedReason: commandPolicyReason,
+            restrictToWorkspace,
+            commandPreview: truncateForDebug(normalizedCommand),
+          },
+        } as any);
         return blockedResult(
           toolDescription,
           command,
@@ -223,6 +259,18 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
             workspaceRoot: workspaceRootCanonical,
             effectiveWorkingDir: effectiveWorkingDirCanonical,
           });
+          logger?.warn({
+            category: "tool",
+            event: "tool.bash_blocked",
+            component: "bashTool",
+            summary: "bash command blocked by workspace policy",
+            data: {
+              toolCallId,
+              blockedReason: workspaceReason,
+              restrictToWorkspace,
+              effectiveWorkingDir: effectiveWorkingDirCanonical,
+            },
+          } as any);
           return blockedResult(
             toolDescription,
             command,
@@ -240,6 +288,7 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         cwd: effectiveWorkingDirCanonical,
         timeoutMs,
         signal,
+        logger,
       });
       debugLog("execution_done", {
         toolCallId,
@@ -267,6 +316,17 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
           nextWorkingDir,
           fallbackWorkingDir: effectiveWorkingDirCanonical,
         });
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_blocked",
+          component: "bashTool",
+          summary: "bash command next working directory blocked",
+          data: {
+            toolCallId,
+            blockedReason: "next_working_dir_outside_workspace",
+            nextWorkingDir,
+          },
+        } as any);
         return blockedResult(
           toolDescription,
           command,
@@ -278,6 +338,36 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
       }
 
       currentWorkingDir = nextWorkingDir;
+      if (execution.timedOut) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_timeout",
+          component: "bashTool",
+          summary: "bash command timed out",
+          data: {
+            toolCallId,
+            timeoutMs,
+            durationMs: execution.durationMs,
+            stdoutBytes: execution.stdout.bytes,
+            stderrBytes: execution.stderr.bytes,
+          },
+        } as any);
+      } else if (execution.exitCode !== 0) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.bash_complete_nonzero",
+          component: "bashTool",
+          summary: "bash command completed with non-zero exit code",
+          data: {
+            toolCallId,
+            exitCode: execution.exitCode,
+            durationMs: execution.durationMs,
+            stdoutBytes: execution.stdout.bytes,
+            stderrBytes: execution.stderr.bytes,
+            stderrPreview: truncateForDebug(execution.stderr.text),
+          },
+        } as any);
+      }
       debugLog("execute_success", {
         toolCallId,
         nextWorkingDir,
@@ -506,6 +596,7 @@ async function runCommand(input: {
   cwd: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  logger?: Logger;
 }): Promise<{
   stdout: { text: string; bytes: number; truncated: boolean };
   stderr: { text: string; bytes: number; truncated: boolean };
@@ -642,6 +733,15 @@ async function runCommand(input: {
     debugLog("run_command_abort", {
       toolCallId: input.toolCallId,
     });
+    input.logger?.warn({
+      category: "tool",
+      event: "tool.bash_aborted",
+      component: "bashTool",
+      summary: "bash command aborted",
+      data: {
+        toolCallId: input.toolCallId,
+      },
+    } as any);
     child.kill("SIGTERM");
     forceKillHandle.timer = setTimeout(() => {
       debugLog("run_command_abort_sigkill", {

@@ -1,6 +1,7 @@
 import type { Agent } from "../agent.js";
 import type { BusEnvelope, MessageBus, UserToAgentPayload } from "../../messageBus/types.js";
 import { createBusMessageId } from "../../messageBus/id.js";
+import type { Logger } from "../../logging/index.js";
 
 export interface AgentWorkerOptions {
   sessionId: string;
@@ -8,7 +9,7 @@ export interface AgentWorkerOptions {
   chatId?: string;
   userId?: string;
   now?: () => number;
-  logger?: Pick<Console, "warn" | "error">;
+  logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
 /**
@@ -20,7 +21,7 @@ export class AgentWorker {
   private readonly chatId: string;
   private readonly userId: string;
   private readonly now: () => number;
-  private readonly logger: Pick<Console, "warn" | "error">;
+  private readonly logger: Pick<Console, "info" | "warn" | "error"> & Partial<Logger>;
 
   private running = false;
   private abortController: AbortController | null = null;
@@ -47,6 +48,16 @@ export class AgentWorker {
     this.running = true;
     this.abortController = new AbortController();
     this.loopPromise = this.runLoop(this.abortController.signal);
+    this.logger.info?.({
+      category: "lifecycle",
+      event: "lifecycle.worker_started",
+      component: "AgentWorker",
+      sessionId: this.options.sessionId,
+      summary: "agent worker started",
+      data: {
+        channel: this.channelType,
+      },
+    } as any);
   }
 
   async stop(): Promise<void> {
@@ -85,6 +96,26 @@ export class AgentWorker {
   private async handleUserEnvelope(
     envelope: BusEnvelope<UserToAgentPayload>
   ): Promise<void> {
+    const turnId = createTurnId(this.now);
+    const start = this.now();
+    this.logger.info?.({
+      category: "agent_turn",
+      event: "agent_turn.start",
+      component: "AgentWorker",
+      sessionId: this.options.sessionId,
+      turnId,
+      messageId: envelope.id,
+      summary: "agent turn started",
+      data: {
+        channel: this.channelType,
+        partTypes: envelope.payload.parts.map((part) => part.type),
+        textLength: envelope.payload.parts
+          .filter((part) => part.type === "text")
+          .reduce((sum, part) => sum + part.text.length, 0),
+        imageCount: envelope.payload.parts.filter((part) => part.type === "image").length,
+      },
+    } as any);
+
     try {
       // Invoke Agent loop !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
       const result = await this.agent.runUserTurn({
@@ -92,7 +123,11 @@ export class AgentWorker {
         channel: this.channelType,
         chatId: this.chatId,
         userId: this.userId,
-        metadata: envelope.meta,
+        metadata: {
+          ...envelope.meta,
+          turnId,
+          busMessageId: envelope.id,
+        },
       });
 
       // publish assistant message to MessageBus
@@ -113,7 +148,33 @@ export class AgentWorker {
           prefix: "bot",
         },
       });
+      this.logger.info?.({
+        category: "agent_turn",
+        event: "agent_turn.complete",
+        component: "AgentWorker",
+        sessionId: this.options.sessionId,
+        turnId,
+        messageId: envelope.id,
+        summary: "agent turn completed",
+        data: {
+          durationMs: this.now() - start,
+          assistantTextLength: result.cliMessage.length,
+        },
+      } as any);
     } catch (error) {
+      this.logger.error?.({
+        category: "agent_turn",
+        event: "agent_turn.failed_user_visible",
+        component: "AgentWorker",
+        sessionId: this.options.sessionId,
+        turnId,
+        messageId: envelope.id,
+        summary: "agent turn failed and user-visible error was published",
+        data: {
+          durationMs: this.now() - start,
+        },
+        error,
+      } as any);
       this.bus.publish({
         id: createBusMessageId(this.now),
         sessionId: this.options.sessionId,
@@ -133,6 +194,10 @@ export class AgentWorker {
       });
     }
   }
+}
+
+function createTurnId(now: () => number): string {
+  return `turn_${now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function isAbortError(error: unknown): boolean {

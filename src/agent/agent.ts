@@ -340,10 +340,52 @@ export class Agent {
   }
 
   private async executeInboundTurn(inbound: InboundMessageTemp): Promise<CliTurnResult> {
+    const turnId = getMetadataString(inbound.metadata, "turnId");
     this.activeTurnCount += 1;
+    const start = this.now();
     try {
       const llmMessages = await this.processInboundMessage(inbound);
+      this.logger.debug({
+        category: "agent_turn",
+        event: "agent_turn.input_mapped",
+        component: "Agent",
+        turnId,
+        summary: "agent turn input mapped to runtime messages",
+        data: {
+          llmMessageCount: llmMessages.length,
+          supportsImageInput: this.supportsImageInput(),
+          inputPartTypes: inbound.parts.map((part) => part.type),
+        },
+      } as any);
+      this.logger.info({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_start",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt started",
+        data: {
+          messageCount: llmMessages.length,
+          runtimeMessageCountBefore: this.agentRuntime.state.messages.length,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+      } as any);
       const assistantMessage = await this.invokeAgentLoop(llmMessages);
+      this.logger.info({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_complete",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt completed",
+        data: {
+          durationMs: this.now() - start,
+          runtimeMessageCountAfter: this.agentRuntime.state.messages.length,
+          assistantTextLength: extractTextLength(assistantMessage),
+          usage: isRecord(assistantMessage) ? assistantMessage.usage : undefined,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+      } as any);
       const outbound = await this.parseAgentResponse(assistantMessage, inbound);
       await this.sendOutboundMessage(outbound);
 
@@ -352,6 +394,21 @@ export class Agent {
         outbound,
         cliMessage: this.parseToMsgForCliTemp(outbound),
       };
+    } catch (error) {
+      this.logger.error({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_failed",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt failed",
+        data: {
+          durationMs: this.now() - start,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+        error,
+      } as any);
+      throw error;
     } finally {
       this.activeTurnCount = Math.max(0, this.activeTurnCount - 1);
     }
@@ -401,13 +458,41 @@ export class Agent {
     }
 
     try {
+      this.logger.info({
+        category: "persistence",
+        event: "persistence.msg_restore_start",
+        component: "Agent",
+        summary: "message restore started",
+        data: {
+          startupRestoreMessageCount: this.startupRestoreMessageCount,
+          currentMessageCount: this.agentRuntime.state.messages.length,
+        },
+      } as any);
+      const start = this.now();
       const loaded = await this.messagePersistenceCoordinator.loadPersistedContextWindow(
         this.agentRuntime.state.messages
       );
       this.agentRuntime.replaceMessages(loaded.messages);
+      this.logger.info({
+        category: "persistence",
+        event: "persistence.msg_restore_complete",
+        component: "Agent",
+        summary: "message restore completed",
+        data: {
+          restoredMessages: loaded.messages.length,
+          persistedCursor: loaded.persistedCursor,
+          durationMs: this.now() - start,
+        },
+      } as any);
     } catch (error) {
       // Defensive catch: coordinator already handles IO failures internally.
-      this.logger.warn(`[message persistence] startup restore failed: ${String(error)}`);
+      this.logger.warn({
+        category: "persistence",
+        event: "persistence.msg_restore_failed",
+        component: "Agent",
+        summary: "message restore failed",
+        error,
+      } as any);
     }
   }
 
@@ -424,7 +509,20 @@ export class Agent {
       return;
     }
 
+    const beforeCount = this.agentRuntime.state.messages.length;
     this.agentRuntime.replaceMessages(compactedMessages.messages);
+    this.logger.info({
+      category: "context",
+      event: "context.compact_executed",
+      component: "Agent",
+      summary: "runtime context compacted",
+      data: {
+        beforeCount,
+        afterCount: compactedMessages.messages.length,
+        droppedCount: beforeCount - compactedMessages.messages.length,
+        persistedCursor: compactedMessages.persistedCursor,
+      },
+    } as any);
   }
 
   private async persistPendingMessages(): Promise<void> {
@@ -502,4 +600,22 @@ function toNonEmptyString(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function getMetadataString(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = metadata?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function extractTextLength(message: AgentMessage): number {
+  const content = isRecord(message) ? message.content : undefined;
+  if (!Array.isArray(content)) {
+    return 0;
+  }
+  return content.reduce((sum, block) => {
+    if (isRecord(block) && typeof block.text === "string") {
+      return sum + block.text.length;
+    }
+    return sum;
+  }, 0);
 }

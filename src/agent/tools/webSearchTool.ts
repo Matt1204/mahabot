@@ -2,6 +2,7 @@ import { Type } from "@mariozechner/pi-ai";
 
 import type { DescribedAgentTool } from "./registry/types.js";
 import { textResult } from "./showcase/shared.js";
+import type { Logger } from "../../logging/index.js";
 
 const DEFAULT_MAX_RESULTS = 5;
 const MAX_RESULTS_LIMIT = 10;
@@ -17,6 +18,7 @@ interface CreateWebSearchToolInput {
   tavilyApiKeyEnvVar?: string;
   linkupApiKeyEnvVar?: string;
   fetchImpl?: FetchLike;
+  logger?: Logger;
 }
 
 type FetchLike = (
@@ -148,6 +150,7 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
   const tavilyApiKeyEnvVar = input.tavilyApiKeyEnvVar ?? "TAVILY_API_KEY";
   const linkupApiKeyEnvVar = input.linkupApiKeyEnvVar ?? "LINKUP_API_KEY";
   const getEnv = DEFAULT_GET_ENV;
+  const logger = input.logger;
 
   const tool: DescribedAgentTool = {
     name: "web_search",
@@ -179,10 +182,33 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
       }
 
       if (tavilyResult.isNetworkError) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.web_search_provider_failed",
+          component: "webSearchTool",
+          summary: "Tavily search failed due to network error",
+          data: {
+            provider: "tavily",
+            errorCode: "network_error",
+            message: tavilyResult.message,
+          },
+        } as any);
         return fail(inputParams.query, "network_error", `Tavily request failed: ${tavilyResult.message}`, providerTried);
       }
 
       if (!isTavilyInsufficientCredits(tavilyResult.status, tavilyResult.message)) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.web_search_provider_failed",
+          component: "webSearchTool",
+          summary: "Tavily search failed",
+          data: {
+            provider: "tavily",
+            status: tavilyResult.status,
+            errorCode: "tavily_failed_non_credit",
+            message: tavilyResult.message,
+          },
+        } as any);
         return fail(
           inputParams.query,
           "tavily_failed_non_credit",
@@ -192,6 +218,17 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
       }
 
       providerTried.push("linkup");
+      logger?.warn({
+        category: "tool",
+        event: "tool.web_search_fallback",
+        component: "webSearchTool",
+        summary: "web search falling back from Tavily to Linkup",
+        data: {
+          from: "tavily",
+          to: "linkup",
+          fallbackReason: "tavily_insufficient_credits",
+        },
+      } as any);
       const linkupApiKey = getEnv(linkupApiKeyEnvVar)?.trim();
       if (!linkupApiKey) {
         return fail(
@@ -215,6 +252,17 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
       }
 
       if (linkupResult.isNetworkError) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.web_search_provider_failed",
+          component: "webSearchTool",
+          summary: "Linkup search failed due to network error",
+          data: {
+            provider: "linkup",
+            errorCode: "network_error",
+            message: linkupResult.message,
+          },
+        } as any);
         return fail(
           inputParams.query,
           "network_error",
@@ -225,6 +273,18 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
       }
 
       if (isLinkupInsufficientCredits(linkupResult.status, linkupResult.message)) {
+        logger?.warn({
+          category: "tool",
+          event: "tool.web_search_provider_failed",
+          component: "webSearchTool",
+          summary: "Linkup search failed due to credits or limits",
+          data: {
+            provider: "linkup",
+            status: linkupResult.status,
+            errorCode: "linkup_insufficient_credits",
+            message: linkupResult.message,
+          },
+        } as any);
         return fail(
           inputParams.query,
           "all_providers_insufficient_credits",
@@ -234,6 +294,18 @@ export function createWebSearchTool(input: CreateWebSearchToolInput = {}): Descr
         );
       }
 
+      logger?.warn({
+        category: "tool",
+        event: "tool.web_search_provider_failed",
+        component: "webSearchTool",
+        summary: "Linkup search failed after fallback",
+        data: {
+          provider: "linkup",
+          status: linkupResult.status,
+          errorCode: "linkup_failed_after_fallback",
+          message: linkupResult.message,
+        },
+      } as any);
       return fail(
         inputParams.query,
         "linkup_failed_after_fallback",
