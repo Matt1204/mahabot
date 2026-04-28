@@ -1,6 +1,9 @@
 import type { AgentToUserPayload, MessageBus } from "../../messageBus/types.js";
 import { formatMarkdownForTelegram } from "./telegramTextFormatter.js";
 
+const TELEGRAM_MAX_MESSAGE_CHARS = 4096;
+const TELEGRAM_SAFE_MESSAGE_CHARS = 3900;
+
 export interface TelegramSendOptions {
   parse_mode?: "HTML";
   link_preview_options?: {
@@ -58,13 +61,77 @@ async function sendFormattedWithPlainTextFallback(
   formatted: ReturnType<typeof formatMarkdownForTelegram>
 ): Promise<void> {
   try {
-    await client.sendMessage(chatId, formatted.text, {
-      parse_mode: formatted.parseMode,
-      link_preview_options: {
-        is_disabled: true,
-      },
-    });
+    for (const chunk of splitTelegramMessage(formatted.text)) {
+      await client.sendMessage(chatId, chunk, {
+        parse_mode: formatted.parseMode,
+        link_preview_options: {
+          is_disabled: true,
+        },
+      });
+    }
   } catch {
-    await client.sendMessage(chatId, originalText);
+    for (const chunk of splitTelegramMessage(originalText)) {
+      await client.sendMessage(chatId, chunk);
+    }
   }
+}
+
+export function splitTelegramMessage(
+  text: string,
+  maxChars = TELEGRAM_SAFE_MESSAGE_CHARS
+): string[] {
+  const normalizedMaxChars = Math.min(
+    Math.max(1, maxChars),
+    TELEGRAM_MAX_MESSAGE_CHARS
+  );
+  if (text.length <= normalizedMaxChars) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > normalizedMaxChars) {
+    const splitAt = findSplitIndex(remaining, normalizedMaxChars);
+    const chunk = remaining.slice(0, splitAt).trimEnd();
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
+function findSplitIndex(text: string, maxChars: number): number {
+  const searchWindow = text.slice(0, maxChars + 1);
+  const paragraphBreak = searchWindow.lastIndexOf("\n\n");
+  if (paragraphBreak > 0) {
+    return paragraphBreak + 2;
+  }
+
+  const lineBreak = searchWindow.lastIndexOf("\n");
+  if (lineBreak > 0) {
+    return lineBreak + 1;
+  }
+
+  const sentenceBreak = Math.max(
+    searchWindow.lastIndexOf("。"),
+    searchWindow.lastIndexOf(". "),
+    searchWindow.lastIndexOf("! "),
+    searchWindow.lastIndexOf("? ")
+  );
+  if (sentenceBreak > 0) {
+    return sentenceBreak + 1;
+  }
+
+  const space = searchWindow.lastIndexOf(" ");
+  if (space > 0) {
+    return space + 1;
+  }
+
+  return maxChars;
 }

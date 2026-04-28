@@ -1,152 +1,238 @@
+import { unified } from "unified";
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+
 export interface TelegramFormattedMessage {
   text: string;
   parseMode: "HTML";
 }
 
-interface MarkdownBlock {
-  type: "text" | "code" | "table";
-  content: string;
-  language?: string;
+interface MdNode {
+  type: string;
+  value?: string;
+  url?: string;
+  lang?: string;
+  ordered?: boolean;
+  start?: number | null;
+  checked?: boolean | null;
+  children?: MdNode[];
 }
 
 export function formatMarkdownForTelegram(input: string): TelegramFormattedMessage {
-  const blocks = splitMarkdownBlocks(input);
-  const text = blocks.map(formatBlock).join("\n");
+  const tree = unified()
+    .use(remarkParse)
+    .use(remarkGfm)
+    .parse(input) as MdNode;
+
   return {
-    text,
+    text: renderRoot(tree).trimEnd(),
     parseMode: "HTML",
   };
 }
 
-function splitMarkdownBlocks(input: string): MarkdownBlock[] {
-  const lines = input.replace(/\r\n/g, "\n").split("\n");
-  const blocks: MarkdownBlock[] = [];
-  let textLines: string[] = [];
+function renderRoot(node: MdNode): string {
+  return renderChildren(node).filter((chunk) => chunk.length > 0).join("\n");
+}
 
-  const flushText = (): void => {
-    if (textLines.length === 0) {
-      return;
-    }
-    blocks.push({ type: "text", content: textLines.join("\n") });
-    textLines = [];
+function renderBlock(node: MdNode, listContext?: ListContext): string {
+  switch (node.type) {
+    case "paragraph":
+      return renderInlineChildren(node);
+    case "heading":
+      return `<b>${renderInlineChildren(node)}</b>`;
+    case "code":
+      return `<pre>${escapeHtml(node.value ?? "")}</pre>`;
+    case "blockquote":
+      return renderBlockquote(node);
+    case "list":
+      return renderList(node);
+    case "listItem":
+      return renderListItem(node, listContext);
+    case "table":
+      return renderTable(node);
+    case "thematicBreak":
+      return "-----";
+    case "html":
+      return escapeHtml(node.value ?? "");
+    default:
+      return renderInline(node);
+  }
+}
+
+function renderInline(node: MdNode): string {
+  switch (node.type) {
+    case "text":
+      return escapeHtml(node.value ?? "");
+    case "break":
+      return "\n";
+    case "inlineCode":
+      return `<code>${escapeHtml(node.value ?? "")}</code>`;
+    case "html":
+      return escapeHtml(node.value ?? "");
+    case "strong":
+      return `<b>${renderInlineChildren(node)}</b>`;
+    case "emphasis":
+      return `<i>${renderInlineChildren(node)}</i>`;
+    case "delete":
+      return `<s>${renderInlineChildren(node)}</s>`;
+    case "link":
+      return renderLink(node);
+    case "image":
+      return renderImage(node);
+    default:
+      return renderInlineChildren(node);
+  }
+}
+
+function renderChildren(node: MdNode): string[] {
+  return (node.children ?? []).map((child) => renderBlock(child));
+}
+
+function renderInlineChildren(node: MdNode): string {
+  return (node.children ?? []).map((child) => renderInline(child)).join("");
+}
+
+function renderBlockquote(node: MdNode): string {
+  return renderChildren(node)
+    .join("\n")
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
+interface ListContext {
+  ordered: boolean;
+  start: number;
+}
+
+function renderList(node: MdNode): string {
+  const context = {
+    ordered: node.ordered === true,
+    start: typeof node.start === "number" ? node.start : 1,
   };
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? "";
-    const fence = line.match(/^```([a-zA-Z0-9_-]*)\s*$/);
-    if (fence) {
-      flushText();
-      const codeLines: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^```\s*$/.test(lines[index] ?? "")) {
-        codeLines.push(lines[index] ?? "");
-        index += 1;
-      }
-      blocks.push({
-        type: "code",
-        content: codeLines.join("\n"),
-        language: fence[1],
-      });
-      continue;
-    }
-
-    if (isMarkdownTableStart(lines, index)) {
-      flushText();
-      const tableLines: string[] = [];
-      while (index < lines.length && isTableLikeLine(lines[index] ?? "")) {
-        tableLines.push(lines[index] ?? "");
-        index += 1;
-      }
-      index -= 1;
-      blocks.push({ type: "table", content: tableLines.join("\n") });
-      continue;
-    }
-
-    textLines.push(line);
-  }
-
-  flushText();
-  return blocks;
+  return (node.children ?? [])
+    .map((child, index) => renderListItem(child, {
+      ordered: context.ordered,
+      start: context.start + index,
+    }))
+    .join("\n");
 }
 
-function formatBlock(block: MarkdownBlock): string {
-  if (block.type === "code") {
-    return `<pre>${escapeHtml(block.content)}</pre>`;
-  }
+function renderListItem(node: MdNode, context?: ListContext): string {
+  const prefix = buildListPrefix(node, context);
+  const rendered = renderChildren(node).join("\n");
+  const lines = rendered.split("\n");
+  const [firstLine = "", ...rest] = lines;
+  const indent = " ".repeat(prefix.length);
 
-  if (block.type === "table") {
-    return `<pre>${escapeHtml(formatMarkdownTable(block.content))}</pre>`;
-  }
-
-  return formatInlineMarkdown(block.content);
+  return [
+    `${prefix}${firstLine}`,
+    ...rest.map((line) => `${indent}${line}`),
+  ].join("\n");
 }
 
-function formatInlineMarkdown(input: string): string {
-  const codeSpans: string[] = [];
-  let text = input.replace(/`([^`\n]+)`/g, (_match, code: string) => {
-    const token = `\u0000CODE${codeSpans.length}\u0000`;
-    codeSpans.push(`<code>${escapeHtml(code)}</code>`);
-    return token;
-  });
-
-  text = escapeHtml(text);
-  text = text.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-  text = text.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
-  text = text.replace(/\*\*([^*\n][^*\n]*?)\*\*/g, "<b>$1</b>");
-  text = text.replace(/__([^_\n][^_\n]*?)__/g, "<b>$1</b>");
-  text = text.replace(/~~([^~\n][^~\n]*?)~~/g, "<s>$1</s>");
-
-  for (const [index, code] of codeSpans.entries()) {
-    text = text.replace(`\u0000CODE${index}\u0000`, code);
+function buildListPrefix(node: MdNode, context?: ListContext): string {
+  const marker = context?.ordered ? `${context.start}. ` : "- ";
+  if (node.checked === true) {
+    return `${marker}[x] `;
   }
-
-  return text;
+  if (node.checked === false) {
+    return `${marker}[ ] `;
+  }
+  return marker;
 }
 
-function formatMarkdownTable(input: string): string {
-  const lines = input.split("\n").filter((line) => line.trim().length > 0);
-  if (lines.length < 2) {
-    return input;
+function renderLink(node: MdNode): string {
+  const url = node.url ?? "";
+  const label = renderInlineChildren(node) || escapeHtml(url);
+  if (!isSafeTelegramLink(url)) {
+    return label;
   }
+  return `<a href="${escapeHtmlAttribute(url)}">${label}</a>`;
+}
 
-  const rows = lines
-    .filter((line, index) => index !== 1 || !isMarkdownTableSeparator(line))
-    .map(parseTableRow);
-  const columnCount = Math.max(...rows.map((row) => row.length));
-  const widths = Array.from({ length: columnCount }, (_, columnIndex) =>
-    Math.max(...rows.map((row) => (row[columnIndex] ?? "").length))
+function renderImage(node: MdNode): string {
+  const url = node.url ?? "";
+  const label = escapeHtml(node.value ?? "image");
+  if (!isSafeTelegramLink(url)) {
+    return label;
+  }
+  return `<a href="${escapeHtmlAttribute(url)}">${label}</a>`;
+}
+
+function renderTable(node: MdNode): string {
+  const rows = (node.children ?? []).map((row) =>
+    (row.children ?? []).map((cell) => renderTableCell(cell))
   );
 
-  const formattedRows = rows.map((row) =>
-    widths.map((width, columnIndex) => (row[columnIndex] ?? "").padEnd(width)).join(" | ").trimEnd()
-  );
-
-  if (formattedRows.length <= 1) {
-    return formattedRows.join("\n");
+  if (rows.length === 0) {
+    return "";
   }
 
-  const separator = widths.map((width) => "-".repeat(Math.max(width, 3))).join("-+-");
-  return [formattedRows[0], separator, ...formattedRows.slice(1)].join("\n");
+  const [headers = [], ...bodyRows] = rows;
+  if (headers.length === 0 || bodyRows.length === 0) {
+    return rows.map((row) => row.join(" | ")).join("\n");
+  }
+
+  if (headers.length === 2) {
+    return bodyRows
+      .map((row) => `<b>${escapeHtml(row[0] ?? "")}</b>: ${escapeHtml(row[1] ?? "")}`)
+      .join("\n");
+  }
+
+  return bodyRows
+    .map((row) => renderVerticalTableRow(headers, row))
+    .join("\n\n");
 }
 
-function parseTableRow(line: string): string[] {
-  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
-  return trimmed.split("|").map((cell) => cell.trim().replace(/\\\|/g, "|"));
+function renderVerticalTableRow(headers: string[], row: string[]): string {
+  const [titleHeader = "Item", ...valueHeaders] = headers;
+  const [title = "", ...values] = row;
+  const lines = [`<b>${escapeHtml(titleHeader)}: ${escapeHtml(title)}</b>`];
+
+  for (const [index, header] of valueHeaders.entries()) {
+    const value = values[index] ?? "";
+    if (!value) {
+      continue;
+    }
+    lines.push(`- <b>${escapeHtml(header)}</b>: ${escapeHtml(value)}`);
+  }
+
+  return lines.join("\n");
 }
 
-function isMarkdownTableStart(lines: string[], index: number): boolean {
-  const current = lines[index] ?? "";
-  const next = lines[index + 1] ?? "";
-  return isTableLikeLine(current) && isMarkdownTableSeparator(next);
+function renderTableCell(node: MdNode): string {
+  return (node.children ?? [])
+    .map((child) => renderPlainText(child))
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function isTableLikeLine(line: string): boolean {
-  return line.includes("|") && line.trim().length > 0;
+function renderPlainText(node: MdNode): string {
+  switch (node.type) {
+    case "text":
+    case "inlineCode":
+    case "code":
+    case "html":
+      return node.value ?? "";
+    case "break":
+      return " ";
+    case "link":
+    case "image":
+      return renderPlainChildren(node) || node.url || "";
+    default:
+      return renderPlainChildren(node);
+  }
 }
 
-function isMarkdownTableSeparator(line: string): boolean {
-  const cells = parseTableRow(line);
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+function renderPlainChildren(node: MdNode): string {
+  return (node.children ?? []).map((child) => renderPlainText(child)).join("");
+}
+
+function isSafeTelegramLink(url: string): boolean {
+  return /^(https?:\/\/|tg:\/\/user\?id=)/i.test(url);
 }
 
 function escapeHtml(input: string): string {
@@ -154,4 +240,8 @@ function escapeHtml(input: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function escapeHtmlAttribute(input: string): string {
+  return escapeHtml(input).replace(/"/g, "&quot;");
 }

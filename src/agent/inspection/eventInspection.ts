@@ -211,9 +211,7 @@ function renderInspectionLine(eventName: string, content: string): string {
 
 function formatTokenUsageLine(usage: InspectionTokenUsage): string {
   return [
-    `curContextSize=${usage.curContextSize}`,
-    `lowWaterMark=${usage.lowWaterMark}`,
-    `highWaterMark=${usage.highWaterMark}`,
+    `curContextSize=${usage.curContextSize}`
   ].join(" ");
 }
 

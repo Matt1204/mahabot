@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 
 import {
   createTelegramEgressRelay,
+  splitTelegramMessage,
   type TelegramSendOptions,
 } from "../../src/gateway/egress/telegramEgressAdapter.ts";
 import { InMemoryMessageBus, createBusMessageId } from "../../src/messageBus/index.ts";
@@ -127,10 +128,7 @@ describe("telegramEgressAdapter", () => {
       sent[0]!.text,
       [
         "<b>重点</b>",
-        "",
-        "<pre>A | B",
-        "----+----",
-        "x | 1</pre>",
+        "<b>x</b>: 1",
       ].join("\n")
     );
     assert.equal(sent[0]!.options?.parse_mode, "HTML");
@@ -218,5 +216,98 @@ describe("telegramEgressAdapter", () => {
         options: undefined,
       },
     ]);
+  });
+
+  test("splits long formatted messages before sending to Telegram", async () => {
+    const bus = new InMemoryMessageBus();
+    const sent: Array<{ chatId: string; text: string; options?: TelegramSendOptions }> = [];
+    const now = () => 4000;
+
+    const stopRelay = createTelegramEgressRelay({
+      bus,
+      sessionId: "tg:1001",
+      chatId: "1001",
+      client: {
+        sendMessage: async (chatId, text, options) => {
+          sent.push({ chatId, text, options });
+          assert.ok(text.length <= 4096);
+        },
+      },
+    });
+
+    bus.publish({
+      id: createBusMessageId(now),
+      sessionId: "tg:1001",
+      ts: now(),
+      direction: "agent_to_user",
+      source: "agent_core",
+      kind: "agent.assistant_message",
+      priority: "high",
+      payload: { text: Array.from({ length: 220 }, (_, index) => `line ${index}: ${"x".repeat(30)}`).join("\n") },
+    });
+
+    await flushDispatch();
+    stopRelay();
+
+    assert.ok(sent.length > 1);
+    assert.equal(sent.every((message) => message.options?.parse_mode === "HTML"), true);
+    assert.equal(sent.map((message) => message.text).join("\n"), Array.from(
+      { length: 220 },
+      (_, index) => `line ${index}: ${"x".repeat(30)}`
+    ).join("\n"));
+  });
+
+  test("splits plain-text fallback messages too", async () => {
+    const bus = new InMemoryMessageBus();
+    const sent: Array<{ chatId: string; text: string; options?: TelegramSendOptions }> = [];
+    const now = () => 5000;
+    let failedHtml = false;
+
+    const stopRelay = createTelegramEgressRelay({
+      bus,
+      sessionId: "tg:1001",
+      chatId: "1001",
+      client: {
+        sendMessage: async (chatId, text, options) => {
+          sent.push({ chatId, text, options });
+          if (options?.parse_mode === "HTML" && !failedHtml) {
+            failedHtml = true;
+            throw new Error("message is too long");
+          }
+        },
+      },
+    });
+
+    const original = `${"x".repeat(4100)}\n${"y".repeat(4100)}`;
+    bus.publish({
+      id: createBusMessageId(now),
+      sessionId: "tg:1001",
+      ts: now(),
+      direction: "agent_to_user",
+      source: "agent_core",
+      kind: "agent.assistant_message",
+      priority: "high",
+      payload: { text: original },
+    });
+
+    await flushDispatch();
+    stopRelay();
+
+    assert.equal(sent[0]!.options?.parse_mode, "HTML");
+    const fallbackMessages = sent.slice(1);
+    assert.ok(fallbackMessages.length > 1);
+    assert.equal(fallbackMessages.every((message) => message.options === undefined), true);
+    assert.equal(fallbackMessages.every((message) => message.text.length <= 4096), true);
+    assert.equal(fallbackMessages.map((message) => message.text).join(""), original.replace("\n", ""));
+  });
+});
+
+describe("splitTelegramMessage", () => {
+  test("prefers paragraph and line boundaries", () => {
+    assert.deepEqual(splitTelegramMessage("aaa\n\nbbb\nccc", 7), ["aaa", "bbb\nccc"]);
+  });
+
+  test("hard-splits long tokens when no boundary exists", () => {
+    assert.deepEqual(splitTelegramMessage("abcdef", 2), ["ab", "cd", "ef"]);
   });
 });

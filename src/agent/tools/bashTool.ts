@@ -8,7 +8,9 @@ import { Type } from "@mariozechner/pi-ai";
 import type { DescribedAgentTool } from "./registry/types.js";
 import { textResult } from "./showcase/shared.js";
 
-const BASH_TIMEOUT_MS = 120_000;
+const DEFAULT_BASH_TIMEOUT_MS = 60_000;
+const MIN_BASH_TIMEOUT_MS = 1_000;
+const MAX_BASH_TIMEOUT_MS = 120_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
 const STDERR_MAX_BYTES = 8 * 1024;
 const STDOUT_TAIL_BYTES = 32 * 1024;
@@ -61,6 +63,7 @@ interface BashToolResult {
   stderrBytes: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  timeoutMs?: number;
   blockedReason?: string;
 }
 
@@ -93,6 +96,14 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
   const bashToolSchema = Type.Object({
     command: Type.String({ minLength: 1 }),
     toolDescription: Type.String({ minLength: 1 }),
+    timeoutMs: Type.Optional(
+      Type.Integer({
+        minimum: MIN_BASH_TIMEOUT_MS,
+        maximum: MAX_BASH_TIMEOUT_MS,
+        default: DEFAULT_BASH_TIMEOUT_MS,
+        description: "Command timeout in milliseconds. Defaults to 60000ms and cannot exceed 120000ms.",
+      })
+    ),
     working_dir: Type.Optional(Type.String({ minLength: 1 })),
   });
 
@@ -109,6 +120,12 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
     async execute(toolCallId, params, signal) {
       const command = normalizeInput(params.command);
       const toolDescription = normalizeInput(params.toolDescription);
+      const timeoutMs = normalizeIntegerInRange(
+        params.timeoutMs,
+        DEFAULT_BASH_TIMEOUT_MS,
+        MIN_BASH_TIMEOUT_MS,
+        MAX_BASH_TIMEOUT_MS
+      );
       const normalizedCommand = command.normalize("NFKC");
       const workspaceRootCanonical = await toPolicyPath(workspaceRoot);
       debugLog("execute_start", {
@@ -118,7 +135,37 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         requestedWorkingDir: params.working_dir ?? "(empty)",
         currentWorkingDir,
         commandPreview: truncateForDebug(command),
+        timeoutMs: timeoutMs === null ? "invalid" : timeoutMs,
       });
+
+      if (timeoutMs === null) {
+        return textResult(
+          [
+            "Bash command blocked by policy:",
+            `- blockedReason: invalid_timeout_ms`,
+            `- toolDescription: ${toolDescription || "(empty)"}`,
+            `- command: ${command || "(empty)"}`,
+            `- timeoutMs: ${String(params.timeoutMs)}`,
+            `- expected: integer in [${MIN_BASH_TIMEOUT_MS}, ${MAX_BASH_TIMEOUT_MS}]`,
+          ].join("\n"),
+          {
+            toolDescription,
+            command,
+            normalizedCommand,
+            effectiveWorkingDir: workspaceRootCanonical,
+            nextWorkingDir: workspaceRootCanonical,
+            exitCode: null,
+            timedOut: false,
+            durationMs: 0,
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            timeoutMs: params.timeoutMs,
+            blockedReason: "invalid_timeout_ms",
+          } satisfies BashToolResult
+        );
+      }
 
       if (!command) {
         debugLog("blocked_empty_command", {
@@ -191,6 +238,7 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         toolCallId,
         command,
         cwd: effectiveWorkingDirCanonical,
+        timeoutMs,
         signal,
       });
       debugLog("execution_done", {
@@ -204,6 +252,7 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
         stderrBytes: execution.stderr.bytes,
         stdoutTruncated: execution.stdout.truncated,
         stderrTruncated: execution.stderr.truncated,
+        timeoutMs,
       });
 
       const nextWorkingDir = await resolveNextWorkingDir(
@@ -240,6 +289,7 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
           nextWorkingDir,
           exitCode: execution.exitCode,
           timedOut: execution.timedOut,
+          timeoutMs,
         }),
         {
           toolDescription,
@@ -254,6 +304,7 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
           stderrBytes: execution.stderr.bytes,
           stdoutTruncated: execution.stdout.truncated,
           stderrTruncated: execution.stderr.truncated,
+          timeoutMs,
         } satisfies BashToolResult
       );
     },
@@ -264,6 +315,23 @@ export function createBashTool(input: CreateBashToolInput): DescribedAgentTool {
 
 function normalizeInput(value: string): string {
   return value.trim();
+}
+
+function normalizeIntegerInRange(
+  value: number | undefined,
+  defaultValue: number,
+  min: number,
+  max: number
+): number | null {
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  if (!Number.isInteger(value) || value < min || value > max) {
+    return null;
+  }
+
+  return value;
 }
 
 function getBlacklistReason(command: string): string | null {
@@ -436,6 +504,7 @@ async function runCommand(input: {
   toolCallId: string;
   command: string;
   cwd: string;
+  timeoutMs: number;
   signal?: AbortSignal;
 }): Promise<{
   stdout: { text: string; bytes: number; truncated: boolean };
@@ -558,7 +627,7 @@ async function runCommand(input: {
     timedOut = true;
     debugLog("run_command_timeout_sigterm", {
       toolCallId: input.toolCallId,
-      timeoutMs: BASH_TIMEOUT_MS,
+      timeoutMs: input.timeoutMs,
     });
     child.kill("SIGTERM");
     forceKillHandle.timer = setTimeout(() => {
@@ -567,7 +636,7 @@ async function runCommand(input: {
       });
       child.kill("SIGKILL");
     }, 300);
-  }, BASH_TIMEOUT_MS);
+  }, input.timeoutMs);
 
   const abortHandler = () => {
     debugLog("run_command_abort", {
@@ -693,6 +762,7 @@ function formatBashOutput(
     nextWorkingDir: string;
     exitCode: number | null;
     timedOut: boolean;
+    timeoutMs: number;
   }
 ): string {
   const stdoutText = stdout.text.length > 0 ? stdout.text : "(empty)";
@@ -706,6 +776,7 @@ function formatBashOutput(
     `- nextWorkingDir: ${meta.nextWorkingDir}`,
     `- exitCode: ${meta.exitCode === null ? "null" : String(meta.exitCode)}`,
     `- timedOut: ${meta.timedOut}`,
+    `- timeoutMs: ${meta.timeoutMs}`,
     `- stdoutBytes: ${stdout.bytes}`,
     `- stderrBytes: ${stderr.bytes}`,
     `- stdoutTruncated: ${stdout.truncated}`,
@@ -785,7 +856,7 @@ function buildToolRulePrompt(input: { workspaceRoot: string; restrictToWorkspace
     "- If your command will create new directories or files, first use this tool to run `ls` to verify the parent directory exists and is the correct location.",
     "- Always quote file paths that contain spaces with double quotes in your command (e.g., cd \"path with spaces/file.txt\")",
     "- Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of `cd`. You may use `cd` if the User explicitly requests it.",
-    "- The command timeout is fixed at 120000ms (2 minutes).",
+    "- The command timeout defaults to 60000ms (60 seconds). You may pass `timeoutMs` for commands that need a different timeout; it must be an integer between 1000ms and 120000ms.",
     "- Write a clear, concise `toolDescription` of what your command does. For simple commands, keep it brief (5-10 words). For complex commands (piped commands, obscure flags, or anything hard to understand at a glance), include enough context so that the user can understand what your command will do.",
     "- When issuing multiple commands:",
     "    - If the commands are independent and can run in parallel, make multiple Bash tool calls in a single message. Example: if you need to run \"git status\" and \"git diff\", send a single message with two Bash tool calls in parallel.",
