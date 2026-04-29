@@ -61,9 +61,24 @@ export class SqliteMessageStore {
       for (const [index, row] of rows.entries()) {
         const record = this.normalizeRow(row);
         if (!record) {
-          this.logger.warn(
-            `[message persistence] skipping invalid SQLite message row ${index + 1} in '${this.config.sessionDbPath}'`
-          );
+          const structuredWarning = {
+            category: "persistence",
+            event: "persistence.msg_restore_invalid_record_skipped",
+            component: "SqliteMessageStore",
+            sessionId: this.config.sessionId,
+            summary: "invalid persisted message record skipped",
+            data: {
+              recordIndex: index + 1,
+              storePath: this.config.sessionDbPath,
+            },
+          };
+          if ("flush" in this.logger) {
+            this.logger.warn(structuredWarning as any);
+          } else {
+            this.logger.warn(
+              `[message persistence] skipping invalid SQLite message row ${index + 1} in '${this.config.sessionDbPath}'`
+            );
+          }
           continue;
         }
         records.push(record);

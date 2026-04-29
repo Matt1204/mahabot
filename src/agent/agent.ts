@@ -14,10 +14,13 @@ import type {
   AgentDependencies,
   AgentFromAppConfigInput,
   AgentRuntimeConfig,
+  AgentRuntimeLifecycleSnapshot,
+  AppliedAgentConfigSnapshot,
   CliTurnResult,
   InboundMessageTemp,
   MemoryBundle,
   OutboundMessageTemp,
+  RuntimeContextSnapshot,
   UserTurnInput,
 } from "./types.js";
 import {
@@ -34,11 +37,19 @@ export class Agent {
   private readonly memoryAssembler?: (input: InboundMessageTemp) => Promise<MemoryBundle>;
   private readonly onAgentEvent?: (event: AgentEvent) => void;
   private readonly messagePersistenceCoordinator?: MessagePersistenceCoordinator;
+  private readonly appliedConfig: AppliedAgentConfigSnapshot;
+  private readonly persistenceEnabled: boolean;
+  private readonly startupRestoreMessageCount: number;
 
   private running = false;
   private loopAbortController: AbortController | null = null;
   private serialQueue: Promise<void> = Promise.resolve();
   private readonly persistedContextLoadPromise: Promise<void>;
+  private readonly contextWatermarks?: {
+    compactLowWatermarkTokens: number;
+    compactHighWatermarkTokens: number;
+  };
+  private activeTurnCount = 0;
 
   /**
    * Static builder for composing runtime dependencies from app-level config.
@@ -63,6 +74,12 @@ export class Agent {
       thinkingLevel: input.thinkingLevel,
       toolRegistry,
       getApiKey: input.getApiKey,
+      appliedConfig: createAppliedAgentConfigSnapshot(
+        model,
+        input.providerName,
+        input.modelName,
+        input.thinkingLevel
+      ),
     };
 
     // 3. instantiate the agent
@@ -77,10 +94,26 @@ export class Agent {
     this.outboundSink = deps.outboundSink;
     this.memoryAssembler = deps.memoryAssembler;
     this.onAgentEvent = deps.onAgentEvent;
+    this.appliedConfig =
+      agentRuntimeConfig.appliedConfig ??
+      createAppliedAgentConfigSnapshot(
+        agentRuntimeConfig.model,
+        "unknown",
+        "unknown",
+        agentRuntimeConfig.thinkingLevel
+      );
+    this.persistenceEnabled = deps.messagePersistence?.enabled ?? false;
+    this.startupRestoreMessageCount = deps.messagePersistence?.startupRestoreMessageCount ?? 0;
     this.messagePersistenceCoordinator = deps.messagePersistence
       ? new MessagePersistenceCoordinator(deps.messagePersistence, {
           logger: this.logger,
         })
+      : undefined;
+    this.contextWatermarks = deps.messagePersistence
+      ? {
+          compactLowWatermarkTokens: deps.messagePersistence.compactLowWatermarkTokens,
+          compactHighWatermarkTokens: deps.messagePersistence.compactHighWatermarkTokens,
+        }
       : undefined;
 
     // Load persisted context exactly once as part of startup, right after runtime/deps are ready.
@@ -266,6 +299,33 @@ export class Agent {
     });
   }
 
+  getRuntimeContextSnapshot(): RuntimeContextSnapshot {
+    const contextBudget = this.messagePersistenceCoordinator?.getContextBudgetSnapshot();
+    return {
+      curContextSize: contextBudget?.curContextSize ?? 0,
+      compactLowWatermarkTokens:
+        contextBudget?.lowWaterMark ?? this.contextWatermarks?.compactLowWatermarkTokens ?? 0,
+      compactHighWatermarkTokens:
+        contextBudget?.highWaterMark ?? this.contextWatermarks?.compactHighWatermarkTokens ?? 0,
+      runtimeMessageCount: this.agentRuntime.state.messages.length,
+      agentBusy: this.activeTurnCount > 0,
+    };
+  }
+
+  getAppliedConfigSnapshot(): AppliedAgentConfigSnapshot {
+    return { ...this.appliedConfig };
+  }
+
+  getRuntimeLifecycleSnapshot(): AgentRuntimeLifecycleSnapshot {
+    return {
+      running: this.running,
+      agentBusy: this.activeTurnCount > 0,
+      runtimeMessageCount: this.agentRuntime.state.messages.length,
+      persistenceEnabled: this.persistenceEnabled,
+      startupRestoreMessageCount: this.startupRestoreMessageCount,
+    };
+  }
+
   wrapToInboundMessageTemp(
     cliMsg: string,
     channel: InboundMessageTemp["channel"] = "cli",
@@ -280,21 +340,82 @@ export class Agent {
   }
 
   private async executeInboundTurn(inbound: InboundMessageTemp): Promise<CliTurnResult> {
-    const llmMessages = await this.processInboundMessage(inbound);
-    const assistantMessage = await this.invokeAgentLoop(llmMessages);
-    const outbound = await this.parseAgentResponse(assistantMessage, inbound);
-    await this.sendOutboundMessage(outbound);
+    const turnId = getMetadataString(inbound.metadata, "turnId");
+    this.activeTurnCount += 1;
+    const start = this.now();
+    try {
+      const llmMessages = await this.processInboundMessage(inbound);
+      this.logger.debug({
+        category: "agent_turn",
+        event: "agent_turn.input_mapped",
+        component: "Agent",
+        turnId,
+        summary: "agent turn input mapped to runtime messages",
+        data: {
+          llmMessageCount: llmMessages.length,
+          supportsImageInput: this.supportsImageInput(),
+          inputPartTypes: inbound.parts.map((part) => part.type),
+        },
+      } as any);
+      this.logger.info({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_start",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt started",
+        data: {
+          messageCount: llmMessages.length,
+          runtimeMessageCountBefore: this.agentRuntime.state.messages.length,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+      } as any);
+      const assistantMessage = await this.invokeAgentLoop(llmMessages);
+      this.logger.info({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_complete",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt completed",
+        data: {
+          durationMs: this.now() - start,
+          runtimeMessageCountAfter: this.agentRuntime.state.messages.length,
+          assistantTextLength: extractTextLength(assistantMessage),
+          usage: isRecord(assistantMessage) ? assistantMessage.usage : undefined,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+      } as any);
+      const outbound = await this.parseAgentResponse(assistantMessage, inbound);
+      await this.sendOutboundMessage(outbound);
 
-    return {
-      inbound,
-      outbound,
-      cliMessage: this.parseToMsgForCliTemp(outbound),
-    };
+      return {
+        inbound,
+        outbound,
+        cliMessage: this.parseToMsgForCliTemp(outbound),
+      };
+    } catch (error) {
+      this.logger.error({
+        category: "llm_provider",
+        event: "agent_turn.llm_prompt_failed",
+        component: "Agent",
+        turnId,
+        summary: "agent runtime prompt failed",
+        data: {
+          durationMs: this.now() - start,
+          provider: this.appliedConfig.modelProvider,
+          model: this.appliedConfig.modelId,
+        },
+        error,
+      } as any);
+      throw error;
+    } finally {
+      this.activeTurnCount = Math.max(0, this.activeTurnCount - 1);
+    }
   }
 
   private supportsImageInput(): boolean {
-    const modelInput = (this.agentRuntime.state.model as { input?: unknown }).input;
-    return Array.isArray(modelInput) && modelInput.includes("image");
+    return modelSupportsImageInput(this.agentRuntime.state.model);
   }
 
   injectSteering(cliMsg: string): void {
@@ -337,13 +458,41 @@ export class Agent {
     }
 
     try {
+      this.logger.info({
+        category: "persistence",
+        event: "persistence.msg_restore_start",
+        component: "Agent",
+        summary: "message restore started",
+        data: {
+          startupRestoreMessageCount: this.startupRestoreMessageCount,
+          currentMessageCount: this.agentRuntime.state.messages.length,
+        },
+      } as any);
+      const start = this.now();
       const loaded = await this.messagePersistenceCoordinator.loadPersistedContextWindow(
         this.agentRuntime.state.messages
       );
       this.agentRuntime.replaceMessages(loaded.messages);
+      this.logger.info({
+        category: "persistence",
+        event: "persistence.msg_restore_complete",
+        component: "Agent",
+        summary: "message restore completed",
+        data: {
+          restoredMessages: loaded.messages.length,
+          persistedCursor: loaded.persistedCursor,
+          durationMs: this.now() - start,
+        },
+      } as any);
     } catch (error) {
       // Defensive catch: coordinator already handles IO failures internally.
-      this.logger.warn(`[message persistence] startup restore failed: ${String(error)}`);
+      this.logger.warn({
+        category: "persistence",
+        event: "persistence.msg_restore_failed",
+        component: "Agent",
+        summary: "message restore failed",
+        error,
+      } as any);
     }
   }
 
@@ -360,7 +509,20 @@ export class Agent {
       return;
     }
 
+    const beforeCount = this.agentRuntime.state.messages.length;
     this.agentRuntime.replaceMessages(compactedMessages.messages);
+    this.logger.info({
+      category: "context",
+      event: "context.compact_executed",
+      component: "Agent",
+      summary: "runtime context compacted",
+      data: {
+        beforeCount,
+        afterCount: compactedMessages.messages.length,
+        droppedCount: beforeCount - compactedMessages.messages.length,
+        persistedCursor: compactedMessages.persistedCursor,
+      },
+    } as any);
   }
 
   private async persistPendingMessages(): Promise<void> {
@@ -399,4 +561,61 @@ function attachContextBudget(
     ...event,
     contextBudget,
   } as AgentEvent;
+}
+
+function createAppliedAgentConfigSnapshot(
+  model: unknown,
+  fallbackProviderName: string,
+  fallbackModelName: string,
+  thinkingLevel: AppliedAgentConfigSnapshot["thinkingLevel"]
+): AppliedAgentConfigSnapshot {
+  const modelRecord = isRecord(model) ? model : {};
+  const modelProvider = toNonEmptyString(modelRecord.provider) ?? fallbackProviderName;
+  const modelId = toNonEmptyString(modelRecord.id) ?? fallbackModelName;
+  const modelDisplayName = toNonEmptyString(modelRecord.name) ?? modelId;
+
+  return {
+    providerName: modelProvider,
+    modelName: modelId,
+    modelProvider,
+    modelId,
+    modelDisplayName,
+    thinkingLevel,
+    supportsImageInput: modelSupportsImageInput(model),
+  };
+}
+
+function modelSupportsImageInput(model: unknown): boolean {
+  const modelInput = isRecord(model) ? model.input : undefined;
+  return Array.isArray(modelInput) && modelInput.includes("image");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function toNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getMetadataString(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = metadata?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function extractTextLength(message: AgentMessage): number {
+  const content = isRecord(message) ? message.content : undefined;
+  if (!Array.isArray(content)) {
+    return 0;
+  }
+  return content.reduce((sum, block) => {
+    if (isRecord(block) && typeof block.text === "string") {
+      return sum + block.text.length;
+    }
+    return sum;
+  }, 0);
 }

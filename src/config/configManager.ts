@@ -11,6 +11,7 @@ import type {
   ModelFactoryModelOverridesConfig,
 } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
+import type { LoggingConfig } from "../logging/index.js";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -419,6 +420,7 @@ function validateAndNormalizeConfig(input: unknown): AppConfig {
   }
 
   validateEventInspectionConfig(merged.eventInspection);
+  validateLoggingConfig(merged.logging);
 
   return merged;
 }
@@ -665,6 +667,61 @@ function validateEventInspectionConfig(
     (!Number.isInteger(value.thinking.maxChars) || value.thinking.maxChars < 1)
   ) {
     throw new Error("Invalid config: eventInspection.thinking.maxChars must be an integer >= 1 when provided.");
+  }
+}
+
+function validateLoggingConfig(value: LoggingConfig): asserts value is LoggingConfig {
+  if (!isRecord(value)) {
+    throw new Error("Invalid config: logging must be an object.");
+  }
+
+  const levels = new Set(["debug", "info", "warn", "error"]);
+  if (typeof value.level !== "string" || !levels.has(value.level)) {
+    throw new Error("Invalid config: logging.level must be one of debug, info, warn, error.");
+  }
+
+  if (typeof value.persist !== "boolean") {
+    throw new Error("Invalid config: logging.persist must be a boolean.");
+  }
+
+  if (typeof value.path !== "string" || value.path.trim().length === 0) {
+    throw new Error("Invalid config: logging.path must be a non-empty string.");
+  }
+  value.path = value.path.trim();
+
+  if (!Number.isInteger(value.maxEntries) || value.maxEntries < 100 || value.maxEntries > 100000) {
+    throw new Error("Invalid config: logging.maxEntries must be an integer in [100, 100000].");
+  }
+
+  if (
+    value.maxAgeMs !== undefined &&
+    (!Number.isInteger(value.maxAgeMs) || value.maxAgeMs < 1)
+  ) {
+    throw new Error("Invalid config: logging.maxAgeMs must be a positive integer when provided.");
+  }
+
+  if (!Number.isInteger(value.compactEveryWrites) || value.compactEveryWrites < 1) {
+    throw new Error("Invalid config: logging.compactEveryWrites must be an integer >= 1.");
+  }
+
+  if (!Number.isInteger(value.compactIntervalMs) || value.compactIntervalMs < 1000) {
+    throw new Error("Invalid config: logging.compactIntervalMs must be an integer >= 1000.");
+  }
+
+  if (typeof value.debugEvents !== "boolean") {
+    throw new Error("Invalid config: logging.debugEvents must be a boolean.");
+  }
+
+  if (typeof value.redactMessageText !== "boolean") {
+    throw new Error("Invalid config: logging.redactMessageText must be a boolean.");
+  }
+
+  if (!Number.isInteger(value.messagePreviewChars) || value.messagePreviewChars < 0 || value.messagePreviewChars > 2000) {
+    throw new Error("Invalid config: logging.messagePreviewChars must be an integer in [0, 2000].");
+  }
+
+  if (typeof value.includeStack !== "boolean") {
+    throw new Error("Invalid config: logging.includeStack must be a boolean.");
   }
 }
 

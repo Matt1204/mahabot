@@ -9,12 +9,19 @@ import type { AgentRuntimeStatusPublisher } from "../agent/runtimeStatus/types.j
 import { assembleTools, ToolRegistry } from "../agent/tools/index.js";
 import { ConfigManager } from "../config/index.js";
 import { ContextManager } from "../context/index.js";
+import { createLogger, type Logger } from "../logging/index.js";
 import {
   evaluateTelegramOnboarding,
   renderTelegramOnboardingReport,
 } from "../onboarding/index.js";
 import { createCliRenderer } from "./egress/cliRenderer.js";
 import { createTelegramEgressRelay } from "./egress/telegramEgressAdapter.js";
+import {
+  RuntimeCommandController,
+  createRuntimeEventInspectionConfig,
+  parseRuntimeCommands,
+  type RuntimeEventInspectionConfig,
+} from "./commands/index.js";
 import { publishCliUserMessage } from "./ingress/cliIngressAdapter.js";
 import { evaluateTelegramIngress } from "./ingress/telegramAccessPolicy.js";
 import { publishTelegramUserParts } from "./ingress/telegramIngressAdapter.js";
@@ -34,6 +41,9 @@ const CLI_WORKSPACE_SESSION_ID = "cli-stable-session";
 interface SessionRuntime {
   agent: Agent;
   worker: AgentWorker;
+  logger: Logger;
+  eventInspectionConfig: RuntimeEventInspectionConfig;
+  commandController: RuntimeCommandController;
 }
 
 interface WorkerBinding {
@@ -57,18 +67,10 @@ interface TelegramSessionRuntime extends SessionRuntime {
  * It no longer handles turn execution directly; AgentWorker consumes MessageBus ingress.
  */
 export class MahabotGatewayManager {
-  private readonly contextManager: ContextManager;
-
   constructor(
     private readonly configManager: ConfigManager = new ConfigManager(),
     private readonly io = { input, output },
-  ) {
-    this.contextManager = new ContextManager(this.configManager, {
-      debug: () => {},
-      warn: console.warn,
-      error: console.error,
-    });
-  }
+  ) {}
 
   async runInCliMode(): Promise<void> {
     const bootstrap = await this.configManager.initializeSessionWorkspace(CLI_WORKSPACE_SESSION_ID);
@@ -139,6 +141,7 @@ export class MahabotGatewayManager {
           try {
             await runtime.worker.stop();
             await runtime.agent.stop();
+            await runtime.logger.flush();
 
             runtime = await this.buildSessionRuntime(
               bootstrap.workspaceSessionId,
@@ -170,6 +173,7 @@ export class MahabotGatewayManager {
       rl.close();
       await runtime.worker.stop();
       await runtime.agent.stop();
+      await runtime.logger.flush();
       stopRenderer();
     }
   }
@@ -218,6 +222,7 @@ export class MahabotGatewayManager {
       if (activeRuntime) {
         await activeRuntime.worker.stop();
         await activeRuntime.agent.stop();
+        await activeRuntime.logger.flush();
         activeRuntime.stopTelegramRelay();
         activeRuntime.pendingImages.stop();
         activeRuntime = null;
@@ -273,7 +278,7 @@ export class MahabotGatewayManager {
             bot.telegram.sendMessage(targetChatId, text, options),
         },
         logger: {
-          warn: console.warn,
+          warn: runtime.logger.warn.bind(runtime.logger),
         },
       });
 
@@ -405,11 +410,28 @@ export class MahabotGatewayManager {
         return;
       }
 
+      const commandParseResult = parseRuntimeCommands(text);
+      for (const unknownCommandText of commandParseResult.unknownCommandTexts) {
+        console.log(`[telegram command] unknown command: ${unknownCommandText}`);
+      }
+
+      if (commandParseResult.commands.length > 0) {
+        const commandResult = activeRuntime.commandController.execute(commandParseResult.commands);
+        for (const reply of commandResult.replies) {
+          await ctx.reply(reply);
+        }
+      }
+
+      const remainingText = commandParseResult.remainingText.trim();
+      if (!remainingText) {
+        return;
+      }
+
       await publishTriggeredTelegramMessage({
         runtime: activeRuntime,
         bus,
         ctx,
-        text,
+        text: remainingText,
         origin: "telegram_text",
       });
     };
@@ -457,6 +479,11 @@ export class MahabotGatewayManager {
   ): Promise<SessionRuntime> {
     const appConfig = this.configManager.get();
     const { provider: activeProvider, model: activeModel } = this.configManager.getActiveProviderModel();
+    const logger = createLogger({
+      config: appConfig.logging,
+      persistenceRoot,
+      sessionId,
+    });
 
     const publishRuntimeStatus: AgentRuntimeStatusPublisher = (status) => {
       bus.publish({
@@ -483,9 +510,11 @@ export class MahabotGatewayManager {
       runtimeStatus: {
         publish: publishRuntimeStatus,
       },
+      logger,
     });
 
-    const systemPromptAssembly = await this.contextManager.assembleSystemPrompt(
+    const contextManager = new ContextManager(this.configManager, logger);
+    const systemPromptAssembly = await contextManager.assembleSystemPrompt(
       sessionId,
       sessionRoot,
       workspaceRoot,
@@ -493,16 +522,18 @@ export class MahabotGatewayManager {
       toolRegistry
     );
 
+    const eventInspectionConfig = createRuntimeEventInspectionConfig(appConfig.eventInspection);
     const eventInspection = new EventInspection(appConfig.eventInspection, {
       publishStatus: publishRuntimeStatus,
+      getInspectionConfig: () => eventInspectionConfig.getSnapshot(),
       getContextWatermarks: () => ({
         lowWaterMark: appConfig.agent.compactLowWatermarkTokens,
         highWaterMark: appConfig.agent.compactHighWatermarkTokens,
       }),
       logger: {
-        debug: () => {},
-        warn: console.warn,
-        error: console.error,
+        debug: logger.debug.bind(logger),
+        warn: logger.warn.bind(logger),
+        error: logger.error.bind(logger),
       },
     });
 
@@ -521,10 +552,10 @@ export class MahabotGatewayManager {
       },
       {
         logger: {
-          debug: () => {},
-          info: () => {},
-          warn: console.warn,
-          error: console.error,
+          debug: logger.debug.bind(logger),
+          info: logger.info.bind(logger),
+          warn: logger.warn.bind(logger),
+          error: logger.error.bind(logger),
         },
         outboundSink: async () => {
           // Final assistant output is delivered through MessageBus by AgentWorker.
@@ -549,14 +580,66 @@ export class MahabotGatewayManager {
       chatId: workerBinding.chatId,
       userId: workerBinding.userId,
       logger: {
-        warn: console.warn,
-        error: console.error,
+        info: logger.info.bind(logger),
+        warn: logger.warn.bind(logger),
+        error: logger.error.bind(logger),
+      },
+    });
+
+    logger.info({
+      category: "lifecycle",
+      event: "lifecycle.runtime_created",
+      component: "MahabotGatewayManager",
+      sessionId,
+      summary: "session runtime created",
+      data: {
+        channel: workerBinding.channel,
+        provider: activeProvider,
+        model: activeModel,
+        toolCount: toolRegistry.getToolNames().length,
+        promptCharCount: systemPromptAssembly.diagnostics.promptCharCount,
+      },
+    });
+    logger.info({
+      category: "lifecycle",
+      event: "lifecycle.agent_started",
+      component: "MahabotGatewayManager",
+      sessionId,
+      summary: "agent runtime started",
+      data: {
+        ...agent.getRuntimeLifecycleSnapshot(),
+      },
+    });
+    logger.info({
+      category: "lifecycle",
+      event: "lifecycle.agent_runtime_snapshot",
+      component: "MahabotGatewayManager",
+      sessionId,
+      summary: "agent runtime snapshot",
+      data: {
+        context: agent.getRuntimeContextSnapshot(),
+        appliedConfig: agent.getAppliedConfigSnapshot(),
+        runtime: agent.getRuntimeLifecycleSnapshot(),
+        toolCount: toolRegistry.getToolNames().length,
+        inspection: eventInspectionConfig.getSnapshot(),
       },
     });
 
     return {
       agent,
       worker,
+      logger,
+      eventInspectionConfig,
+      commandController: new RuntimeCommandController({
+        eventInspectionConfig,
+        getContextSnapshot: () => agent.getRuntimeContextSnapshot(),
+        getAgentStateSnapshot: () => ({
+          context: agent.getRuntimeContextSnapshot(),
+          appliedConfig: agent.getAppliedConfigSnapshot(),
+          runtime: agent.getRuntimeLifecycleSnapshot(),
+          toolCount: toolRegistry.getToolNames().length,
+        }),
+      }),
     };
   }
 }

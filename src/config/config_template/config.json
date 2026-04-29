@@ -70,5 +70,18 @@
       "enabled": false,
       "emitMode": "on_end"
     }
+  },
+  "logging": {
+    "level": "info",
+    "persist": true,
+    "path": "logs/latest.ndjson",
+    "maxEntries": 1000,
+    "maxAgeMs": 604800000,
+    "compactEveryWrites": 100,
+    "compactIntervalMs": 60000,
+    "debugEvents": false,
+    "redactMessageText": true,
+    "messagePreviewChars": 120,
+    "includeStack": true
   }
 }

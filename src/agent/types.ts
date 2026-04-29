@@ -46,6 +46,7 @@ export interface AgentRuntimeConfig {
   transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
   getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
   onPayload?: (payload: unknown) => unknown;
+  appliedConfig?: AppliedAgentConfigSnapshot;
 }
 
 export interface AgentFromAppConfigInput {
@@ -66,6 +67,32 @@ export interface MessagePersistenceConfig {
   startupRestoreMessageCount: number;
   compactHighWatermarkTokens: number;
   compactLowWatermarkTokens: number;
+}
+
+export interface RuntimeContextSnapshot {
+  curContextSize: number;
+  compactLowWatermarkTokens: number;
+  compactHighWatermarkTokens: number;
+  runtimeMessageCount: number;
+  agentBusy: boolean;
+}
+
+export interface AppliedAgentConfigSnapshot {
+  providerName: string;
+  modelName: string;
+  modelProvider: string;
+  modelId: string;
+  modelDisplayName: string;
+  thinkingLevel: ThinkingLevel;
+  supportsImageInput: boolean;
+}
+
+export interface AgentRuntimeLifecycleSnapshot {
+  running: boolean;
+  agentBusy: boolean;
+  runtimeMessageCount: number;
+  persistenceEnabled: boolean;
+  startupRestoreMessageCount: number;
 }
 
 export interface AgentDependencies {

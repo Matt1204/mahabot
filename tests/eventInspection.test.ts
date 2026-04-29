@@ -246,4 +246,40 @@ describe("EventInspection to MessageBus runtime status", () => {
     assert.equal(published[0].kind, "agent.runtime.thinking");
     assert.equal(published[0].text, "[thinking] assembled from deltas");
   });
+
+  test("reads dynamic inspection config after construction", async () => {
+    const published: AgentRuntimeStatusMessage[] = [];
+    let config = createConfig({});
+    const inspection = new EventInspection(createConfig({}), {
+      publishStatus: (message) => published.push(message),
+      getInspectionConfig: () => config,
+    });
+
+    inspection.handleAgentEvent({ type: "turn_start" } as any);
+    await waitForInspectionFlush();
+    assert.equal(published.length, 0);
+
+    config = createConfig({ turn_start: true });
+    inspection.handleAgentEvent({ type: "turn_start" } as any);
+    await waitForInspectionFlush();
+
+    assert.equal(published.length, 1);
+    assert.equal(published[0].text, "[turn_start] Starting your request.");
+  });
+
+  test("reads one inspection config snapshot per runtime event", async () => {
+    let snapshotReadCount = 0;
+    const inspection = new EventInspection(createConfig({ turn_start: true }), {
+      publishStatus: () => {},
+      getInspectionConfig: () => {
+        snapshotReadCount += 1;
+        return createConfig({ turn_start: true });
+      },
+    });
+
+    inspection.handleAgentEvent({ type: "turn_start" } as any);
+    await waitForInspectionFlush();
+
+    assert.equal(snapshotReadCount, 1);
+  });
 });

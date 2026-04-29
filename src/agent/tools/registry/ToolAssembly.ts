@@ -1,6 +1,7 @@
 import type { AppConfig } from "../../../config/types.js";
 import { resolve } from "node:path";
 import type { AgentRuntimeStatusPublisher } from "../../runtimeStatus/types.js";
+import type { Logger } from "../../../logging/index.js";
 import { createBashTool } from "../bashTool.js";
 import { createInFlightUpdateTool } from "../inFlightUpdateTool.js";
 import { createEditFileTool } from "../editFileTool.js";
@@ -27,6 +28,7 @@ export interface ToolRuntimeContext {
   runtimeStatus?: {
     publish: AgentRuntimeStatusPublisher;
   };
+  logger?: Logger;
 }
 
 /**
@@ -59,6 +61,7 @@ function registerStandardTools(
     createWebSearchTool({
       tavilyApiKeyEnvVar: appConfig.tools.webSearch.tavilyApiKeyEnvVar,
       linkupApiKeyEnvVar: appConfig.tools.webSearch.linkupApiKeyEnvVar,
+        logger: toolRuntimeContext.logger,
     })
   );
   if (toolRuntimeContext.runtimeStatus) {
@@ -76,6 +79,7 @@ function registerStandardTools(
       createBashTool({
         workspaceRoot: toolRuntimeContext.workspaceRoot,
         restrictToWorkspace: appConfig.tools.restrictToWorkspace,
+        logger: toolRuntimeContext.logger,
       })
     );
     registry.registerStandard(

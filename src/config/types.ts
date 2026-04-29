@@ -1,5 +1,6 @@
 import type { OpenAICompletionsCompat, OpenAIResponsesCompat } from "@mariozechner/pi-ai";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { LoggingConfig } from "../logging/types.js";
 
 export type IngressProvider = "telegram";
 
@@ -119,6 +120,7 @@ export interface AppConfig {
   agent: AgentConfig;
   tools: ToolsConfig;
   eventInspection: EventInspectionConfig;
+  logging: LoggingConfig;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -189,5 +191,18 @@ export const DEFAULT_CONFIG: AppConfig = {
       enabled: false,
       emitMode: "on_end",
     },
+  },
+  logging: {
+    level: "info",
+    persist: true,
+    path: "logs/latest.ndjson",
+    maxEntries: 1000,
+    maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+    compactEveryWrites: 100,
+    compactIntervalMs: 60_000,
+    debugEvents: false,
+    redactMessageText: true,
+    messagePreviewChars: 120,
+    includeStack: true,
   },
 };
