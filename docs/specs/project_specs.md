@@ -16,7 +16,7 @@ The current operating ecosystem is Node.js `>=22.5.0`, TypeScript ESM with `Node
 
 External actors are human CLI users, whitelisted Telegram users, Telegram Bot API, LLM providers configured in `agent.llmProviders`, OpenAI-compatible audio transcription used for Telegram voice messages, Tavily and Linkup search APIs, local shell and filesystem facilities, and `ffmpeg` for audio conversion. Telegram supports private text, photo, and voice messages. Group chats and unsupported message types are rejected at ingress.
 
-Inside the system boundary are the CLI entrypoint, gateway manager, CLI and Telegram ingress adapters, Telegram media storage and voice transcription adapters, CLI and Telegram egress adapters, in-memory message bus, agent worker loop, agent runtime wrapper, model factory, context assembly, skills catalog, tool registry and tools, event inspection, SQLite persistence, onboarding checks, and tests.
+Inside the system boundary are the CLI entrypoint, gateway manager, CLI and Telegram ingress adapters, Telegram media storage and voice transcription adapters, CLI and Telegram egress adapters, Telegram runtime-command parsing and control, in-memory message bus, agent worker loop, agent runtime wrapper, model factory, context assembly, skills catalog, tool registry and tools, event inspection, structured logging, SQLite persistence, onboarding checks, and tests.
 
 Outside the system boundary are Telegram infrastructure behavior, bot account provisioning, LLM provider internals, OpenAI transcription service internals, Tavily/Linkup availability and billing, `ffmpeg` installation, OS-level file permissions, and any hosted deployment architecture. There is no HTTP server, webhook listener, external queue, external database server, container definition, or multi-region deployment in `v1`.
 
@@ -24,11 +24,11 @@ Boundary-crossing data flows are concrete and directional. CLI text enters throu
 
 Trust boundaries are important. User content and Telegram media are untrusted. MessageBus validates envelope shape, but it is not an authorization layer. Telegram ingress enforces private chat plus allowed Telegram user ids before messages reach the runtime. Tool execution is the most privileged local boundary because bash and filesystem tools can affect the local machine; policy is enforced by workspace restrictions and command blacklists, but cannot prove every command is safe. Secrets are read from environment variables and should not be persisted. LLM and transcription calls send user content, images, tool outputs, and prompts to external providers.
 
-Ownership boundaries are as follows. `gateway` owns process lifecycle and channel wiring. `messageBus` owns envelope validation, queueing, and subscriber fanout. `agent/worker` owns user-message consumption and assistant envelope publication. `agent/agent` owns serial turn execution, runtime events, model interaction, persistence hooks, and compaction. `config` owns defaults, validation, bootstrap paths, and credential env-var names. `context` owns prompt assembly. `tools` own tool schemas and execution policy. `ingress/telegram*` owns Telegram access, media buffering, download, and transcription preparation. `egress` owns channel rendering only.
+Ownership boundaries are as follows. `gateway` owns process lifecycle and channel wiring. `gateway/commands` owns parsing recognized Telegram control tokens and mutating session-local inspection state; it does not persist config changes. `messageBus` owns envelope validation, queueing, and subscriber fanout. `agent/worker` owns user-message consumption and assistant envelope publication. `agent/agent` owns serial turn execution, runtime events, applied/runtime snapshots, model interaction, persistence hooks, and compaction. `config` owns defaults, validation, bootstrap paths, and credential env-var names. `context` owns prompt assembly. `tools` own tool schemas and execution policy. `logging` owns structured event normalization, redaction, console output, bounded NDJSON retention, and flush semantics. `ingress/telegram*` owns Telegram access, media buffering, download, and transcription preparation. `egress` owns channel rendering only.
 
 ## 2. Overall Architecture Design
 
-The architecture style is a modular monolith with event-driven internal communication. One Node.js process owns ingress, message routing, agent execution, tools, persistence, and egress. The implementation is modular because source boundaries are explicit: gateway, bus, worker, agent runtime, config/context, persistence, media handling, tools, skills, and inspection are separated by narrow interfaces.
+The architecture style is a modular monolith with event-driven internal communication. One Node.js process owns ingress, message routing, agent execution, tools, persistence, observability, and egress. The implementation is modular because source boundaries are explicit: gateway, commands, bus, worker, agent runtime, config/context, persistence, media handling, tools, skills, inspection, and logging are separated by narrow interfaces.
 
 This style fits `v1` because the product is a personal agent shell rather than a hosted service. LLM and tool calls dominate latency, so externalizing the message bus would not currently improve the critical path. The in-memory bus is still a useful extraction point for `v2`: if durable multi-process execution is needed, preserve the envelope contract first.
 
@@ -38,10 +38,12 @@ High-level structure:
 src/cli.ts
   -> MahabotGatewayManager
       -> ConfigManager.initializeSessionWorkspace/load
+      -> session-scoped structured Logger
       -> InMemoryMessageBus
       -> ToolRegistry + assembleTools
       -> ContextManager.assembleSystemPrompt
       -> EventInspection
+      -> RuntimeEventInspectionConfig + RuntimeCommandController
       -> Agent.createFromAppConfig
       -> AgentWorker.start
 
@@ -59,13 +61,17 @@ Agent execution:
 Persistence:
   pi-agent-core state.messages -> MessagePersistenceCoordinator
     -> SqliteMessageStore -> persistence/session.sqlite
+
+Observability:
+  components -> structured Logger -> ConsoleLogSink
+                                -> NdjsonLogStore -> persistence/logs/latest.ndjson
 ```
 
 Runtime topology is a single Node.js process. CLI mode owns stdin/stdout and a readline loop. Telegram mode owns a Telegraf polling client, one active private chat per process run, a serialized message queue, a Telegram egress relay, a media store, a pending-image buffer, and a voice transcriber. Bash tool calls spawn child shell processes. Voice transcription spawns `ffmpeg` through `execFile` and then performs an HTTP transcription request. SQLite is embedded in-process, not a network service.
 
 The scalability model is intentionally local. The bus has per-session FIFO queues and could technically hold multiple sessions, but gateway policy creates one CLI session or one active Telegram chat. There is no queue size limit, durable queue, rate limiter, worker pool, or horizontal scale. Telegram message handling is serialized by chaining `messageQueue` promises, which preserves predictable order but limits throughput to one Telegram message handler at a time.
 
-Fault tolerance is defensive but local. Subscriber failures are caught and logged. Bus dispatch is deferred with `queueMicrotask`. Worker turn failures become user-visible assistant error messages. Event inspection failures are isolated. Persistence restore failures start without history; append failures log and keep running. Telegram send failures are caught and logged. Voice temp files and converted MP3s are removed in `finally`. Shutdown stops workers, aborts the agent runtime, stops Telegraf, unsubscribes relays, and clears pending images.
+Fault tolerance is defensive but local. Subscriber failures are caught and logged. Bus dispatch is deferred with `queueMicrotask`. Worker turn failures become user-visible assistant error messages. Event inspection failures are isolated. Persistence restore failures start without history; append failures log and keep running. Telegram formatted-send failure retries once as plain text. Voice temp files and converted MP3s are removed in `finally`. NDJSON writes are serialized and internal store errors fall back to console reporting. Shutdown stops workers, aborts the agent runtime, stops Telegraf, unsubscribes relays, clears pending images, flushes persistence, and flushes logs.
 
 Deployment is npm-based. Development commands are `npm run cli`, `npm run telegram`, `npm run playground`, and `npm run dev`. Build is `npm run build`, which runs TypeScript compilation and copies config templates. The package binary is `mahabot`, pointing to `dist/cli.js`. Session files are created under `~/.mahabot/<sanitized-session-id>/`.
 
@@ -85,7 +91,13 @@ The gateway manager is the lifecycle orchestrator. In both CLI and Telegram mode
 
 In CLI mode it owns readline and local commands: `/help`, `/clear`, and exit aliases. `/clear` stops the current worker and agent, rebuilds the runtime with the same bus and session paths, and reloads the system prompt. It does not delete the SQLite history; it clears active runtime context by rebuilding the runtime.
 
-In Telegram mode it runs onboarding checks, resolves bot token and whitelist, starts Telegraf long polling, accepts only private chats, allows only configured Telegram user ids, and locks a process run to the first accepted chat. It serializes message handling through a promise chain, which keeps photo buffering, voice transcription, and text publication ordered.
+In Telegram mode it runs onboarding checks, resolves bot token and whitelist, starts Telegraf long polling, accepts only private chats, allows only configured Telegram user ids, and locks a process run to the first accepted chat. It serializes message handling through a promise chain, which keeps photo buffering, voice transcription, command execution, and text publication ordered. Runtime construction also creates a structured logger, session-local event-inspection state, and a command controller bound to read-only agent snapshots.
+
+### Telegram Runtime Commands (`src/gateway/commands/*`)
+
+`parseRuntimeCommands` recognizes a fixed allowlist of slash commands only in contiguous leading and trailing token regions. It supports Telegram `@botname` suffixes, preserves unknown slash tokens in the remaining prompt, returns command order and origin, and avoids interpreting command-like text in the middle of prose. Recognized commands are `/context`, `/agent_state`, `/inspect`, `/inspect_all_on`, `/inspect_all_off`, `/inspect_tool_on`, `/inspect_tool_off`, `/inspect_thinking_on`, and `/inspect_thinking_off`.
+
+`RuntimeCommandController` executes recognized commands synchronously. Read commands format the agent's current token-budget, applied-model, lifecycle, tool-count, and inspection snapshots. Mutation commands update only `RuntimeEventInspectionConfig`, a defensive-copy session object initialized from startup config. They do not write `config.json` or rebuild the agent. Command replies are sent directly through Telegram before any remaining prompt is published; command-only messages do not drain pending images or create agent turns. Enabling all inspection events intentionally excludes thinking, whose visibility has a separate explicit switch.
 
 ### Telegram Runtime Config and Access Policy
 
@@ -163,6 +175,14 @@ Filesystem tools resolve paths through workspace policy, reject invalid or outsi
 
 `EventInspection` listens to pi-agent-core events through `Agent` and emits optional `agent.runtime.event`, `agent.runtime.token_usage`, and `agent.runtime.thinking` envelopes. It uses microtask deferral so inspection does not run inline with the agent event callback. Token usage emission is deduplicated by fingerprint. Thinking emission only supports `emitMode: "on_end"` and can truncate via `maxChars`.
 
+Inspection reads a fresh immutable snapshot for each event, so Telegram inspection commands affect subsequent events without mutating static application config. Agent snapshots expose the resolved provider/model, image-input capability, thinking level, running/busy state, message count, persistence state, restore limit, last known context tokens, and configured compaction watermarks without exposing mutable runtime internals.
+
+### Structured Logging (`src/logging/*`)
+
+The logging subsystem accepts typed `LogInput` records and legacy strings. Typed records become `LogEvent` objects with generated id, timestamp, level, category, event name, component, summary, optional session/turn/message correlation, sanitized data, and normalized errors. Level filtering occurs before sinks. Accepted events reach `ConsoleLogSink`; persistence receives non-debug events by default and debug events only when `logging.debugEvents` is enabled.
+
+`NdjsonLogStore` serializes append and compaction through one promise chain, retains at most `maxEntries`, optionally removes entries older than `maxAgeMs`, and compacts after configured write/time thresholds or at flush. Compaction parses valid records, writes a temporary file, then atomically renames it. Keys matching API-key, authorization, token, secret, or password patterns are redacted; buffers become byte counts and errors are normalized with optional stacks. This subsystem owns operational telemetry, while SQLite owns conversational `AgentMessage` durability.
+
 ## 4. Inter-Module Relationships and Communication
 
 Ingress adapters communicate with MessageBus synchronously in-process by calling `publish`. The schema is `BusEnvelope<UserToAgentPayload>`. Validation failure propagates immediately as an exception. There is no retry because publish is local and deterministic once input is built. Idempotency is producer-owned; the bus accepts duplicate semantic messages if ids differ.
@@ -177,6 +197,8 @@ Agent communicates with SQLite through `MessagePersistenceCoordinator` and `Sqli
 
 Telegram ingress communicates with Telegram Bot API through Telegraf. Downloads use `getFileLink` and `fetch`. Photo download failures produce Telegram replies and stop that message path. Voice download/conversion/transcription failures produce Telegram replies and do not publish a user message. Telegram egress sends one or more `sendMessage` calls; formatted send failure triggers plain-text fallback.
 
+Telegram text first passes through the command parser after authorization and runtime activation. Recognized commands flow directly to `RuntimeCommandController` and then to `ctx.reply`; this is synchronous state access/mutation followed by asynchronous Telegram egress. Any remaining text proceeds to pending-image consumption and bus publication. The command path has no transaction with an agent turn: command replies occur first, and a later publication failure does not roll back inspection changes. Commands are idempotent state assignments except read commands; repeated enable/disable commands converge on the same snapshot.
+
 Telegram photo-to-text flow is intentionally two-step. A photo message downloads and buffers image parts, but does not enqueue an agent turn. The next text or voice message consumes pending images if not expired, appends the trigger text, and publishes a single structured user turn. This gives the user a chance to send context for images.
 
 Voice flow is photo-compatible. If pending images exist, the voice transcript submits them together with the transcript text. If pending images expired, their files are deleted and the transcript is processed alone.
@@ -188,6 +210,8 @@ There is no circuit breaker implementation. Partial outages degrade by component
 ## 5. Domain Model and Behavior Design
 
 Core domain entities are Session, BusEnvelope, UserToAgentPart, AgentToUserPayload, InboundMessageTemp, OutboundMessageTemp, AgentMessage, PersistedMessageRecord, TelegramPendingImageBuffer entry, and Tool result.
+
+Operational domain values include `RuntimeEventInspectionConfigSnapshot`, `RuntimeContextSnapshot`, `AppliedAgentConfigSnapshot`, `AgentRuntimeLifecycleSnapshot`, and `LogEvent`. Inspection state is session-local and mutable only through its controller interface. Snapshot getters return copies so consumers cannot mutate ownership state indirectly. A `LogEvent` is append-only after creation and correlates activity by session, turn, and message identifiers where producers supply them.
 
 A Session is identified by a sanitized string. CLI uses `cli-stable-session`. Telegram uses `tg:<chatId>` before sanitization by workspace bootstrap or media path sanitization. A session owns its workspace, prompt files, persistence database rows, skills root, and active agent runtime.
 
@@ -254,6 +278,8 @@ Migration strategy is minimal in `v1`: `schema_version` exists on each row, but 
 
 Data lifecycle is append-only. `persistence/session.sqlite` retains all successfully appended messages unless manually deleted. Runtime compaction only reduces in-memory context. `history.md` is currently reserved in prompt context but not used for transcript writes. Telegram image files under `persistence/media/.../images` are retained after submission. Telegram voice temp files under `persistence/tmp/.../voice` are deleted after transcription attempts. Expired pending image files are deleted when expiry is detected by later message handling.
 
+Operational logs use newline-delimited JSON at a configurable path resolved relative to the persistence root (default `logs/latest.ndjson`). Unlike messages, logs have bounded retention: compaction filters invalid/expired lines and keeps the newest configured number. Writes are ordered in-process, but log and message stores have independent transaction boundaries. There is no relational join; correlation relies on duplicated session/turn/message ids.
+
 There is no cache layer beyond in-memory runtime state, message bus queues, and pending image buffer. There is no read/write separation. Consistency is strong within one SQLite append transaction and in-memory process ordering, but not durable for queued bus messages or pending image buffer state across process crashes.
 
 ## 7. API and Contract Design
@@ -268,6 +294,8 @@ CLI commands are:
 - `/help`, `/clear`, and `/exit` are runtime CLI commands.
 
 Telegram public contract accepts private text, photo, and voice messages only. Non-private chats receive a rejection. Non-whitelisted users receive access denied. Unsupported message types receive "Unsupported message type. Send text, voice, or photo." Photos are acknowledged and buffered; text or voice submits a turn. Voice is submitted as transcription text, not as audio bytes to the main LLM.
+
+Telegram also exposes nine fixed runtime-control commands. `/context`, `/agent_state`, and `/inspect` are read-only snapshot queries. `/inspect_all_on|off`, `/inspect_tool_on|off`, and `/inspect_thinking_on|off` mutate ephemeral inspection state. Command tokens may appear at the leading or trailing edge, including an `@BotName` suffix. Unknown tokens remain agent input. There is no HTTP endpoint, topic namespace, or external event schema; internal message kinds act as the event namespace.
 
 Internal bus contract:
 
@@ -304,7 +332,7 @@ Multi-tenant isolation is not implemented. The runtime is intended for one local
 
 Encryption in transit relies on provider HTTPS and Telegram API transport. SQLite data and downloaded images are stored unencrypted at rest in the user's home directory. Temporary voice files are also stored unencrypted until deleted. There is no key management system, envelope encryption, or secure deletion.
 
-Audit logging is limited to console warnings/errors, bus diagnostic queues in memory, SQLite persisted agent messages, and retained Telegram image files. There is no immutable audit log, user action journal, or centralized telemetry.
+Audit and operational visibility use structured console events and bounded NDJSON logs, bus diagnostic queues in memory, SQLite persisted agent messages, and retained Telegram image files. Log fields with secret-like keys are recursively redacted, and message bodies are generally represented by lengths/previews according to producer and config rather than indiscriminately persisted. Logs are not immutable or centrally collected, so they are operational evidence rather than a compliance audit trail.
 
 Threat model:
 
@@ -313,7 +341,7 @@ Threat model:
 - Filesystem exfiltration risk exists if `restrictToWorkspace` is false or if allowed roots are expanded. The default is restricted.
 - Telegram spoofing risk is mitigated by checking `from.id`, not username.
 - Media handling risk includes large or malformed files. Voice conversion has timeout and size checks after conversion; photo download has no explicit size cap in code.
-- Secret leakage risk exists if prompts or tools expose environment variables through shell commands. No general secret redaction layer is implemented.
+- Secret leakage risk exists if prompts or tools expose environment variables through shell commands or include secrets under innocuous field names. Structured log data redacts recognized secret-like keys, but that is not a general data-loss-prevention boundary.
 
 Security-sensitive `v2` work should add per-tool policy, media size caps, encrypted persistence option, explicit secret redaction, and a clearer distinction between chat ids and user ids in config naming.
 
@@ -327,7 +355,7 @@ Backpressure is partial. Agent turns are serialized by `runExclusive`; Telegram 
 
 Resilience mechanisms include local try/catch boundaries, abortable waiters, graceful shutdown, SQLite transactions, WAL mode, formatted Telegram fallback, transcription temp-file cleanup, and best-effort persistence. Availability target is "best effort local process availability"; no SLA is encoded.
 
-Observability is console-oriented. Event inspection can publish user-visible event, token usage, inflight update, and thinking lines. Bash debug logging can be enabled with `MAHABOT_BASH_TOOL_DEBUG`. There is no metrics backend, tracing system, structured JSON log standard, alerting model, or health endpoint.
+Observability combines user-visible runtime inspection with structured process logging. Event inspection can publish event, token usage, inflight update, and explicitly enabled thinking lines. Structured logs use stable categories and event names, correlation identifiers, console rendering, and retained NDJSON. There is no metrics backend, distributed tracing, alert transport, or health endpoint; inferred availability monitoring therefore remains manual log inspection.
 
 Known bottlenecks are LLM calls, image base64 memory use for large photos, voice conversion and transcription, synchronous SQLite operations during append/read, shell subprocess duration, unbounded message queues, and Telegram 4096-character message splitting.
 
@@ -337,7 +365,7 @@ Environment separation is session-directory based, not deployment-stage based. E
 
 Configuration injection uses JSON config plus environment variables. Defaults live in `src/config/types.ts`; templates live under `src/config/config_template`; user config is merged over defaults. Environment variable names are configurable for Telegram bot token, LLM provider keys, web search keys, and transcription key.
 
-Feature flags are represented as config booleans rather than a feature-flag service. Examples are `ingress.telegram.enabled`, `tools.restrictToWorkspace`, `eventInspection.useEventInspection`, `eventInspection.showTokenUsage`, and `eventInspection.thinking.enabled`.
+Feature flags are represented as config booleans rather than a feature-flag service. Examples are `ingress.telegram.enabled`, `tools.restrictToWorkspace`, `eventInspection.useEventInspection`, `eventInspection.showTokenUsage`, `eventInspection.thinking.enabled`, `logging.persist`, and `logging.debugEvents`. Telegram inspection commands overlay session-local state but deliberately do not modify startup config.
 
 Rollout strategy is manual: edit config, run tests, build, and restart the process. There is no CI/CD definition in the repository beyond npm scripts. There is no infrastructure-as-code, blue/green, canary, or migration orchestration.
 
@@ -354,8 +382,10 @@ Major dependencies are:
 - `telegraf` `^4.16.3` for Telegram long polling and Bot API access.
 - `dotenv` for environment loading.
 - `unified`, `remark-parse`, and `remark-gfm` for Markdown-to-Telegram formatting.
-- `yaml` is present as a dependency, likely for skills/frontmatter-related parsing.
+- `yaml` parses skill frontmatter metadata.
 - TypeScript, tsx, and Node types are dev dependencies.
+
+Node built-ins provide SQLite, filesystem/path/process primitives, child processes, readline, locally generated identifiers, and fetch/FormData support; there is no ORM, web framework, or external logging SDK.
 
 Internal dependency layering is roughly:
 
@@ -369,6 +399,8 @@ context
   -> config, skills, tool registry
 tools
   -> filesystem/shared, runtimeStatus, external search APIs
+logging
+  -> console sink, NDJSON store (no gateway dependency)
 messageBus
   -> no app-level modules
 ```
@@ -399,6 +431,10 @@ Voice handling failure can occur at download, missing API key, missing `ffmpeg`,
 
 Bash tool failure returns structured tool output with exit code, timeout, stderr, or blocked reason. It does not crash the process. High-risk commands are blocked in restricted mode, but command parsing is pattern-based and not a formal shell sandbox.
 
+Runtime command failure is narrowly scoped because parsing is pure and execution reads in-memory snapshots. A Telegram reply failure may leave an inspection mutation applied even though its acknowledgement was not delivered. Since these settings are ephemeral and converge under repeated commands, recovery is to retry the command or restart the session. Unknown commands never mutate runtime state.
+
+Logging failure does not intentionally fail an agent turn. NDJSON operations run on a serialized chain and report internal failures to the configured console callback. A process crash can lose queued-but-unflushed log lines; shutdown calls `flush`, which drains and compacts. Corrupt NDJSON lines are omitted during compaction. Inferred RPO for logs is the last completed append, and RTO is immediate console-only operation plus repair/removal of the log file.
+
 Disaster recovery is manual. Users can delete or copy `~/.mahabot/<session>/`, restore `config.json` and prompt files, and preserve or replace `persistence/session.sqlite`. RTO is the time to restart the process and restore config. RPO is last successful SQLite append for conversation state; pending bus messages and pending image buffers have RPO of zero because they are not durable.
 
 ## 13. Versioning and Evolution Strategy
@@ -415,6 +451,8 @@ Model evolution must preserve image capability detection. If future models repre
 
 Contract testing should cover text turns, Telegram photo buffering and expiry, voice transcription success/failure with mocked clients, SQLite restore/append/invalid rows, model image support gating, Telegram formatting fallback, bus validation, and tool policy boundaries.
 
+Current tests additionally pin command edge parsing, runtime inspection mutation semantics, controller reply formatting, event inspection snapshot refresh, structured log filtering/redaction/retention, skill parsing/catalog behavior, context prompt integration, persistence window alignment, and detailed behavior of bash/read/grep/glob/web-search tools. These are compatibility tests even where no external API exists.
+
 Deprecation timelines are not implemented. For a local tool, a practical rule is to support one config schema migration path for at least one minor version and refuse ambiguous legacy shapes with clear remediation.
 
 ## 14. Formal Consistency and Invariants
@@ -425,6 +463,8 @@ System-wide invariants:
 - One `Agent` instance executes turns serially through `runExclusive`.
 - Telegram mode has at most one active chat per process run.
 - Unsupported or unauthorized Telegram messages never reach the agent.
+- A command-only Telegram message never becomes an agent turn and never consumes pending images.
+- Runtime inspection mutations affect only the active session snapshot and never rewrite `config.json`.
 
 Data invariants:
 
@@ -433,6 +473,7 @@ Data invariants:
 - Image parts reference local files and have a non-empty MIME type.
 - Agent-to-user envelopes have non-empty text.
 - SQLite records use `schema_version = 1`, matching `session_id`, finite `persisted_at`, and parseable object `message_json`.
+- Structured log events have ids, timestamps, levels, categories, event names, components, and summaries; known secret-key fields are redacted before persistence.
 
 Transaction invariants:
 
@@ -440,6 +481,7 @@ Transaction invariants:
 - Runtime compaction persists pending messages before dropping in-memory messages.
 - Startup restore only occurs when the runtime message list is empty.
 - Restored/compacted windows must align to completed assistant turns when possible.
+- NDJSON append/compaction operations are serialized within a store, and compaction replaces the destination via temporary-file rename.
 
 Security invariants:
 
@@ -457,5 +499,7 @@ Operational invariants:
 - Telegram egress failure must not crash the process.
 - Voice temp files should be removed after transcription attempts.
 - MessageBus subscriber failures must be isolated.
+- Inspection config getters return defensive snapshots; one event is evaluated against one coherent snapshot.
+- Logger flush must drain pending writes before runtime shutdown completes.
 
 These invariants are enforced partly by code and partly by tests. For `v2`, any implementation that changes the runtime topology should keep these invariants explicit, because they are the practical safety rails that let a personal local agent manipulate files, run tools, and interact with external AI services without becoming unpredictable.
